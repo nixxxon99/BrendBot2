@@ -1,46 +1,61 @@
 from aiogram import Router, F
+from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
-from app.services.brands import exact_lookup, get_brand
-from app.services.ai_duck import web_search_brand, image_search_brand, build_caption_from_results, FetchError
 
 router = Router()
 
-# Простая "сессия" AI-режима в памяти процесса
+# Кто сейчас в AI-режиме (память процесса)
 AI_USERS: set[int] = set()
 
 @router.callback_query(F.data == "ai:enter")
-async def enter_ai(c: CallbackQuery):
+async def enter_ai_cb(c: CallbackQuery):
     AI_USERS.add(c.from_user.id)
     await c.message.answer(
-        "⚡ Включен режим ИИ-помощника.\n"
-        "Напиши название бренда или вопрос про алкоголь.\n"
-        "Чтобы выйти — напиши: Выйти из AI"
+        "⚡ ИИ-режим включён.\n"
+        "Пиши название бренда или вопрос про алкоголь.\n"
+        "Чтобы выйти — напиши: Выйти из AI или /ai_off"
     )
     await c.answer()
 
+@router.message(Command("ai"))
+async def enter_ai_cmd(m: Message):
+    AI_USERS.add(m.from_user.id)
+    await m.answer(
+        "⚡ ИИ-режим включён.\n"
+        "Пиши название бренда или вопрос.\n"
+        "Чтобы выйти — напиши: Выйти из AI или /ai_off"
+    )
+
 @router.message(F.text == "Выйти из AI")
+@router.message(Command("ai_off"))
 async def exit_ai(m: Message):
     AI_USERS.discard(m.from_user.id)
-    await m.answer("Режим ИИ-помощника выключен. Можешь снова пользоваться меню брендов.")
+    await m.answer("ИИ-режим выключен. Используй меню брендов или /ai чтобы включить снова.")
 
-# Обрабатываем текст ТОЛЬКО если пользователь в AI-режиме
-@router.message(F.text.func(lambda _: True))
+@router.message(F.text)
 async def ai_any_text(m: Message):
+    # Обрабатываем только если пользователь в AI-режиме
     if m.from_user.id not in AI_USERS:
-        return  # не наш режим — пусть другие роутеры (бренды/подсказки) обработают
+        return
 
     q = (m.text or "").strip()
     if not q:
         return
 
-    # 1) сначала пробуем локальный каталог
+    from app.services.brands import exact_lookup, get_brand
+    from app.services.ai_duck import (
+        web_search_brand, image_search_brand,
+        build_caption_from_results, FetchError
+    )
+
+    # 1) Пробуем локальную базу
     name = exact_lookup(q)
     if name:
         item = get_brand(name)
         await m.answer_photo(photo=item["photo_file_id"], caption=item["caption"], parse_mode="HTML")
         return
 
-    # 2) веб-поиск
+    # 2) Веб-поиск
     await m.answer("Ищу в интернете… (2–5 сек)")
     try:
         results = web_search_brand(q)
@@ -52,4 +67,3 @@ async def ai_any_text(m: Message):
             await m.answer(caption, parse_mode="HTML")
     except FetchError:
         await m.answer("Не получилось получить данные из интернета. Попробуй другой запрос.")
-
