@@ -1,0 +1,53 @@
+{
+  "Monkey Shoulder": {
+    "category": "Виски",
+    "photo_file_id": "AgACAgIAAxkBAAIG1Gg4mSjJixcbMGy0c8I78DrLN9OpAAJe7jEbCVnJSTfCOMW8hxrQAQADAgADeAADNgQ",
+    "caption": "<b>Monkey Shoulder</b>\\n• Купажированный шотландский виски от William Grant & Sons\\n• Состоит из солодов Glenfiddich, Balvenie и Kininvie\\n• Название отсылает к травме плеча у солодовщиков\\n• Яркий ванильно-медовый аромат с нотами цитруса\\n• Вкус: тёплая карамель, специи, тосты\\n• Крепость: 40% ABV\\n• Идеален для коктейлей: Old Fashioned, Whisky Sour",
+    "aliases": [
+      "monkey shoulder",
+      "monkey",
+      "манки",
+      "манки шолдер",
+      "монки"
+    ]
+  },
+  "Glenfiddich 12 Years": {
+    "category": "Виски",
+    "photo_file_id": "AgACAgIAAxkBAAIG2Gg4ncf9Rpxv9rooJ0Ha2FD40CORAAK_8jEbPObJSR3uT8xKG0UpAQADAgADeQADNgQ",
+    "caption": "<b>Glenfiddich 12 Years Old</b>\\n• Односолодовый виски (Спейсайд)\\n• Аромат: груша, дуб\\n• Вкус: зелёные яблоки, ваниль\\n• Выдержка: 12 лет\\n• Крепость: 40% ABV",
+    "aliases": [
+      "glenfiddich 12",
+      "гленфиддик 12",
+      "glenfiddich"
+    ]
+  },
+  "Серебрянка": {
+    "category": "Водка",
+    "photo_file_id": "AgACAgIAAxkBAAIK-Gg8CRgDjmxfkUP-Ui86uo8Lm4OSAAJS9zEbPHPgSVUkEXccwFmIAQADAgADeQADNgQ",
+    "caption": "<b>Серебрянка</b>\\n• Казахстанская водка\\n• Мягкий вкус, фильтрация через серебро\\n• Крепость: 40%",
+    "aliases": [
+      "серебрянка",
+      "serebryanka",
+      "серебро"
+    ]
+  },
+  "Paulaner": {
+    "category": "Пиво",
+    "photo_file_id": "AgACAgIAAxkBAAILKmg8FzKSP73SszDZhdcxRRRWag1hAAKl9zEbPHPgSSyVatusTBp3AQADAgADeQADNgQ",
+    "caption": "<b>Paulaner</b>\\n• Немецкое пиво, стили: Hefe-Weißbier, Hell\\n• Ноты банана, гвоздики, солода",
+    "aliases": [
+      "paulaner",
+      "пауланер"
+    ]
+  },
+  "Jägermeister": {
+    "category": "Ликёр",
+    "photo_file_id": "AgACAgIAAxkBAAIMG2g8Lf1fleLtxA30kh_bN-YFxQx9AAKM-DEbPHPgSXiVPEBRiD1GAQADAgADeAADNgQ",
+    "caption": "<b>Jägermeister</b>\\n• Немецкий травяной ликёр 35%\\n• 56 трав и специй, выдержка в дубе\\n• Подача: шот при -18°C",
+    "aliases": [
+      "jagermeister",
+      "ягермейстер",
+      "ягер"
+    ]
+  }
+}
