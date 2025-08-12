@@ -2,9 +2,13 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
+from app.services.brands import exact_lookup, get_brand
+from app.services.ai_duck import web_search_brand, image_search_brand, build_caption_from_results, FetchError
+from app.services.ai_llm import have_llm, generate_card_with_llm
+
 router = Router()
 
-# Кто сейчас в AI-режиме (память процесса)
+# Пользователи в режиме AI (память процесса)
 AI_USERS: set[int] = set()
 
 @router.callback_query(F.data == "ai:enter")
@@ -42,24 +46,23 @@ async def ai_any_text(m: Message):
     if not q:
         return
 
-    from app.services.brands import exact_lookup, get_brand
-    from app.services.ai_duck import (
-        web_search_brand, image_search_brand,
-        build_caption_from_results, FetchError
-    )
-
-    # 1) Пробуем локальную базу
+    # 1) если есть локальная карточка — отдаем быстро
     name = exact_lookup(q)
     if name:
         item = get_brand(name)
         await m.answer_photo(photo=item["photo_file_id"], caption=item["caption"], parse_mode="HTML")
         return
 
-    # 2) Веб-поиск
-    await m.answer("Ищу в интернете… (2–5 сек)")
+    # 2) иначе — веб-поиск и генерация карточки
+    await m.answer("Ищу в интернете и готовлю карточку… (2–7 сек)")
     try:
         results = web_search_brand(q)
-        caption = build_caption_from_results(q, results)
+        # LLM (если ключ есть), иначе fallback на просто склейку сниппетов
+        if have_llm():
+            caption = await generate_card_with_llm(q, results)
+        else:
+            caption = build_caption_from_results(q, results)
+
         img = image_search_brand(q + " бутылка бренд алкоголь label")
         if img:
             await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
