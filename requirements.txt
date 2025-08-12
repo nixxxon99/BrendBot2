@@ -1,0 +1,10 @@
+
+aiogram==3.4.1
+flask[async]==2.3.3
+hypercorn==0.17.3
+redis==5.0.1
+python-dotenv
+rapidfuzz==3.9.6
+httpx==0.27.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
