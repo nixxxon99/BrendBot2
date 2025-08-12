@@ -1,4 +1,3 @@
-
 import os
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -9,6 +8,8 @@ class Settings(BaseSettings):
     webhook_url: str = Field(default="", alias="WEBHOOK_URL")
     webhook_secret: str = Field(default="MARS", alias="WEBHOOK_SECRET")
     tz: str = Field(default=os.getenv("TZ", "Asia/Almaty"), alias="TZ")
+    bing_api_key: str | None = Field(default=None, alias="BING_API_KEY")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
 
     class Config:
         env_file = ".env"
