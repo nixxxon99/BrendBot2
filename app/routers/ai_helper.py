@@ -5,6 +5,13 @@ import logging
 import time
 import re  # для санитайзера
 
+from app.keyboards.menus import (
+    AI_ENTRY_BUTTON_TEXT,
+    AI_EXIT_BUTTON_TEXT,
+    main_menu_kb,
+    ai_exit_inline_kb,
+)
+
 # === Санитайзер HTML под Telegram ===
 def _sanitize_caption(html: str) -> str:
     if not html:
@@ -72,30 +79,39 @@ def _cache_get(key: str):
 def _cache_set(key: str, data: dict) -> None:
     _CACHE[key] = (time.time(), data)
 
-@router.callback_query(F.data == "ai:enter")
-async def enter_ai_cb(c: CallbackQuery):
-    AI_USERS.add(c.from_user.id)
-    await c.message.answer(
-        "⚡ ИИ-режим включён.\n"
-        "Пиши название бренда или вопрос про алкоголь.\n"
-        "Чтобы выйти — напиши: Выйти из AI или /ai_off"
+@router.message(F.text == AI_ENTRY_BUTTON_TEXT)
+async def enter_ai_by_button(m: Message):
+    AI_USERS.add(m.from_user.id)
+    await m.answer(
+        "AI-режим включён. Напишите название бренда или вопрос.",
+        reply_markup=None,
     )
-    await c.answer()
 
 @router.message(Command("ai"))
 async def enter_ai_cmd(m: Message):
     AI_USERS.add(m.from_user.id)
     await m.answer(
-        "⚡ ИИ-режим включён.\n"
-        "Пиши название бренда или вопрос.\n"
-        "Чтобы выйти — напиши: Выйти из AI или /ai_off"
+        "AI-режим включён. Напишите название бренда или вопрос.",
+        reply_markup=None,
     )
 
-@router.message(F.text == "Выйти из AI")
+@router.callback_query(F.data == "ai:exit")
+async def exit_ai_cb(c: CallbackQuery):
+    AI_USERS.discard(c.from_user.id)
+    await c.message.answer(
+        "AI-режим выключен. Вы в главном меню.",
+        reply_markup=main_menu_kb(),
+    )
+    await c.answer()
+
+@router.message(F.text == AI_EXIT_BUTTON_TEXT)
 @router.message(Command("ai_off"))
-async def exit_ai(m: Message):
+async def exit_ai_cmd(m: Message):
     AI_USERS.discard(m.from_user.id)
-    await m.answer("ИИ-режим выключен. Используй меню брендов или /ai чтобы включить снова.")
+    await m.answer(
+        "AI-режим выключен. Вы в главном меню.",
+        reply_markup=main_menu_kb(),
+    )
 
 # ⚠️ Хендлер сработает ТОЛЬКО если пользователь уже в AI_USERS
 @router.message(F.text & F.from_user.id.func(lambda uid: uid in AI_USERS))
@@ -113,9 +129,9 @@ async def ai_any_text(m: Message):
         raw = await generate_sales_playbook_with_gemini(q, sale.get("outlet"), brand_guess)
         text = _sanitize_caption(raw)
         try:
-            await m.answer(text, parse_mode="HTML")
+            await m.answer(text, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
         except Exception:
-            await m.answer(text)
+            await m.answer(text, reply_markup=ai_exit_inline_kb())
         return
 
     # 1) если бренд есть в базе — отдаём локальную карточку
@@ -124,10 +140,19 @@ async def ai_any_text(m: Message):
         item = get_brand(name)
         caption = _sanitize_caption(item["caption"])
         try:
-            await m.answer_photo(photo=item["photo_file_id"], caption=caption, parse_mode="HTML")
+            await m.answer_photo(
+                photo=item["photo_file_id"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=ai_exit_inline_kb(),
+            )
         except Exception:
             # на всякий случай — без HTML
-            await m.answer_photo(photo=item["photo_file_id"], caption=caption)
+            await m.answer_photo(
+                photo=item["photo_file_id"],
+                caption=caption,
+                reply_markup=ai_exit_inline_kb(),
+            )
         return
 
     # 2) иначе — веб-поиск (Google CSE) + генерация текста (Gemini при наличии)
@@ -148,15 +173,24 @@ async def ai_any_text(m: Message):
         img = image_search_brand(q + " бутылка бренд алкоголь label")
         try:
             if img and img.get("contentUrl"):
-                await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
+                await m.answer_photo(
+                    photo=img["contentUrl"],
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=ai_exit_inline_kb(),
+                )
             else:
-                await m.answer(caption, parse_mode="HTML")
+                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
         except Exception:
             # если Telegram вдруг ругнётся на разметку — отправим без parse_mode
             if img and img.get("contentUrl"):
-                await m.answer_photo(photo=img["contentUrl"], caption=caption)
+                await m.answer_photo(
+                    photo=img["contentUrl"],
+                    caption=caption,
+                    reply_markup=ai_exit_inline_kb(),
+                )
             else:
-                await m.answer(caption)
+                await m.answer(caption, reply_markup=ai_exit_inline_kb())
 
     except FetchError as e:
         log.warning("[AI] fetch error: %s", e)
@@ -165,8 +199,11 @@ async def ai_any_text(m: Message):
             raw = await generate_caption_with_gemini(q, results=None)
             caption = _sanitize_caption(raw)
             try:
-                await m.answer(caption, parse_mode="HTML")
+                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
             except Exception:
-                await m.answer(caption)
+                await m.answer(caption, reply_markup=ai_exit_inline_kb())
         else:
-            await m.answer("Не получилось получить данные из интернета. Попробуй другой запрос.")
+            await m.answer(
+                "Не получилось получить данные из интернета. Попробуй другой запрос.",
+                reply_markup=ai_exit_inline_kb(),
+            )
