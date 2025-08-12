@@ -16,6 +16,6 @@ dp.message.middleware(ErrorsLoggingMiddleware())
 
 # Routers
 dp.include_router(main_router.router)
-dp.include_router(brands_router.router)
 dp.include_router(ai_helper_router.router)  # <-- подключаем
+dp.include_router(brands_router.router)
 
