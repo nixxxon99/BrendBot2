@@ -3,14 +3,15 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 import logging
 import time
-import re  # +++
+import re  # для санитайзера
 
+# === Санитайзер HTML под Telegram ===
 def _sanitize_caption(html: str) -> str:
     if not html:
         return ""
     t = html
 
-    # заголовки h1..h6 -> убираем (можно заменить на <b>, но проще убрать)
+    # заголовки h1..h6 -> убрать
     t = re.sub(r'</?(h[1-6])[^>]*>', '', t, flags=re.I)
 
     # списки -> маркеры
@@ -29,14 +30,11 @@ def _sanitize_caption(html: str) -> str:
     t = re.sub(r'<em[^>]*>', '<i>', t, flags=re.I)
     t = re.sub(r'</em>', '</i>', t, flags=re.I)
 
-    # вычищаем любые другие теги, кроме допустимых Telegram:
-    # b, i, u, s, a, code, pre, br
+    # оставить только разрешённые: b, i, u, s, a, code, pre, br
     t = re.sub(r'<(?!/?(b|i|u|s|a|code|pre|br)\b)[^>]+>', '', t, flags=re.I)
 
-    # сжимаем множественные переносы
+    # сжать лишние пустые строки и ограничить длину подписи (у фото ~1024)
     t = re.sub(r'\n{3,}', '\n\n', t).strip()
-
-    # лимит для подписи к фото (~1024), берём запас
     if len(t) > 1000:
         t = t[:1000].rstrip() + "…"
     return t
@@ -110,7 +108,12 @@ async def ai_any_text(m: Message):
     name = exact_lookup(q)
     if name:
         item = get_brand(name)
-        await m.answer_photo(photo=item["photo_file_id"], caption=item["caption"], parse_mode="HTML")
+        caption = _sanitize_caption(item["caption"])
+        try:
+            await m.answer_photo(photo=item["photo_file_id"], caption=caption, parse_mode="HTML")
+        except Exception:
+            # на всякий случай — без HTML
+            await m.answer_photo(photo=item["photo_file_id"], caption=caption)
         return
 
     # 2) иначе — веб-поиск (Google CSE) + генерация текста (Gemini при наличии)
@@ -122,21 +125,34 @@ async def ai_any_text(m: Message):
             _cache_set(q, results)
 
         if have_gemini():
-            caption = await generate_caption_with_gemini(q, results)
+            raw = await generate_caption_with_gemini(q, results)
         else:
-            caption = build_caption_from_results(q, results)
+            raw = build_caption_from_results(q, results)
+
+        caption = _sanitize_caption(raw)
 
         img = image_search_brand(q + " бутылка бренд алкоголь label")
-        if img and img.get("contentUrl"):
-            await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
-        else:
-            await m.answer(caption, parse_mode="HTML")
+        try:
+            if img and img.get("contentUrl"):
+                await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
+            else:
+                await m.answer(caption, parse_mode="HTML")
+        except Exception:
+            # если Telegram вдруг ругнётся на разметку — отправим без parse_mode
+            if img and img.get("contentUrl"):
+                await m.answer_photo(photo=img["contentUrl"], caption=caption)
+            else:
+                await m.answer(caption)
 
     except FetchError as e:
         log.warning("[AI] fetch error: %s", e)
         # Если поиск упал, но Gemini есть — сгенерируем карточку без поиска
         if have_gemini():
-            caption = await generate_caption_with_gemini(q, results=None)
-            await m.answer(caption, parse_mode="HTML")
+            raw = await generate_caption_with_gemini(q, results=None)
+            caption = _sanitize_caption(raw)
+            try:
+                await m.answer(caption, parse_mode="HTML")
+            except Exception:
+                await m.answer(caption)
         else:
             await m.answer("Не получилось получить данные из интернета. Попробуй другой запрос.")
