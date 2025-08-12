@@ -42,8 +42,9 @@ def _sanitize_caption(html: str) -> str:
 from app.services.brands import exact_lookup, get_brand
 # Поиск и картинки — через Google CSE
 from app.services.ai_google import (
-    web_search_brand, image_search_brand, build_caption_from_results, FetchError
+    web_search_brand, build_caption_from_results, FetchError
 )
+from app.services.wiki_images import wiki_image_brand
 # Текст карточки — через Gemini (если есть ключ), иначе fallback на простую сводку
 from app.services.ai_gemini import have_gemini, generate_caption_with_gemini
 
@@ -131,14 +132,18 @@ async def ai_any_text(m: Message):
 
         caption = _sanitize_caption(raw)
 
-        img = image_search_brand(q + " бутылка бренд алкоголь label")
+        # --- только Википедия ---
+        img = wiki_image_brand(q)
+        # опционально подпишем источник
+        if img and img.get("pageUrl"):
+            caption = caption + f"\n\n<i>Источник фото: {img['pageUrl']}</i>"
+            caption = _sanitize_caption(caption)
         try:
             if img and img.get("contentUrl"):
                 await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
             else:
                 await m.answer(caption, parse_mode="HTML")
         except Exception:
-            # если Telegram вдруг ругнётся на разметку — отправим без parse_mode
             if img and img.get("contentUrl"):
                 await m.answer_photo(photo=img["contentUrl"], caption=caption)
             else:
@@ -148,11 +153,21 @@ async def ai_any_text(m: Message):
         log.warning("[AI] fetch error: %s", e)
         # Если поиск упал, но Gemini есть — сгенерируем карточку без поиска
         if have_gemini():
-            raw = await generate_caption_with_gemini(q, results=None)
-            caption = _sanitize_caption(raw)
+            caption = await generate_caption_with_gemini(q, results=None)
+            caption = _sanitize_caption(caption)
+            img = wiki_image_brand(q)
+            if img and img.get("pageUrl"):
+                caption = caption + f"\n\n<i>Источник фото: {img['pageUrl']}</i>"
+                caption = _sanitize_caption(caption)
             try:
-                await m.answer(caption, parse_mode="HTML")
+                if img and img.get("contentUrl"):
+                    await m.answer_photo(photo=img["contentUrl"], caption=caption, parse_mode="HTML")
+                else:
+                    await m.answer(caption, parse_mode="HTML")
             except Exception:
-                await m.answer(caption)
+                if img and img.get("contentUrl"):
+                    await m.answer_photo(photo=img["contentUrl"], caption=caption)
+                else:
+                    await m.answer(caption)
         else:
             await m.answer("Не получилось получить данные из интернета. Попробуй другой запрос.")
