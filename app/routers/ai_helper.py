@@ -3,6 +3,43 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 import logging
 import time
+import re  # +++
+
+def _sanitize_caption(html: str) -> str:
+    if not html:
+        return ""
+    t = html
+
+    # заголовки h1..h6 -> убираем (можно заменить на <b>, но проще убрать)
+    t = re.sub(r'</?(h[1-6])[^>]*>', '', t, flags=re.I)
+
+    # списки -> маркеры
+    t = re.sub(r'</?ul[^>]*>|</?ol[^>]*>', '', t, flags=re.I)
+    t = re.sub(r'<li[^>]*>', '• ', t, flags=re.I)
+    t = re.sub(r'</li>', '\n', t, flags=re.I)
+
+    # параграфы/брейки -> переносы строк
+    t = re.sub(r'<p[^>]*>', '', t, flags=re.I)
+    t = re.sub(r'</p>', '\n', t, flags=re.I)
+    t = re.sub(r'<br\s*/?>', '\n', t, flags=re.I)
+
+    # strong/em -> поддерживаемые b/i
+    t = re.sub(r'<strong[^>]*>', '<b>', t, flags=re.I)
+    t = re.sub(r'</strong>', '</b>', t, flags=re.I)
+    t = re.sub(r'<em[^>]*>', '<i>', t, flags=re.I)
+    t = re.sub(r'</em>', '</i>', t, flags=re.I)
+
+    # вычищаем любые другие теги, кроме допустимых Telegram:
+    # b, i, u, s, a, code, pre, br
+    t = re.sub(r'<(?!/?(b|i|u|s|a|code|pre|br)\b)[^>]+>', '', t, flags=re.I)
+
+    # сжимаем множественные переносы
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+
+    # лимит для подписи к фото (~1024), берём запас
+    if len(t) > 1000:
+        t = t[:1000].rstrip() + "…"
+    return t
 
 from app.services.brands import exact_lookup, get_brand
 # Поиск и картинки — через Google CSE
