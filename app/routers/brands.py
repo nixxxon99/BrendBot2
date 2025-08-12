@@ -1,9 +1,11 @@
-
 from aiogram import Router, F
 from aiogram.types import Message
 from app.keyboards.common import categories_kb
 from app.services.brands import categories, by_category, exact_lookup, fuzzy_suggest, get_brand
 from app.services.stats import record_brand_view
+
+# 👇 добавили: чтобы знать, включён ли AI-режим у пользователя
+from app.routers.ai_helper import AI_USERS
 
 router = Router()
 
@@ -55,6 +57,11 @@ async def send_brand_card(m: Message):
 # Fuzzy suggestions when user types free text
 @router.message(lambda m: m.text is not None and exact_lookup(m.text) is None)
 async def suggest(m: Message):
+    # ⛔️ если пользователь в AI-режиме — не перехватываем и не показываем подсказки,
+    # пусть запрос уйдёт в ai_helper (онлайн-поиск и сборка карточки)
+    if m.from_user.id in AI_USERS:
+        return
+
     qs = m.text.strip()
     suggestions = fuzzy_suggest(qs, limit=6)
     if not suggestions:
