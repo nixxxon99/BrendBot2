@@ -46,6 +46,8 @@ from app.services.ai_google import (
 )
 # Текст карточки — через Gemini (если есть ключ), иначе fallback на простую сводку
 from app.services.ai_gemini import have_gemini, generate_caption_with_gemini
+from app.services.sales_intents import detect_sales_intent  # NEW
+from app.services.ai_gemini import generate_sales_playbook_with_gemini  # NEW
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -103,6 +105,18 @@ async def ai_any_text(m: Message):
         return
 
     log.info("[AI] user=%s query=%r", m.from_user.id, q)
+
+    # 0) Если это «как продать …» — даём sales playbook и выходим
+    sale = detect_sales_intent(q)
+    if sale and have_gemini():
+        brand_guess = exact_lookup(q)  # если удастся вытащить бренд из запроса
+        raw = await generate_sales_playbook_with_gemini(q, sale.get("outlet"), brand_guess)
+        text = _sanitize_caption(raw)
+        try:
+            await m.answer(text, parse_mode="HTML")
+        except Exception:
+            await m.answer(text)
+        return
 
     # 1) если бренд есть в базе — отдаём локальную карточку
     name = exact_lookup(q)
