@@ -4,7 +4,7 @@ from aiogram.types import Message, CallbackQuery
 import logging
 
 from app.services.brands import exact_lookup, get_brand
-from app.services.ai_duck import web_search_brand, image_search_brand, build_caption_from_results, FetchError
+from app.services.ai_google import web_search_brand, image_search_brand, build_caption_from_results, FetchError
 from app.services.ai_llm import have_llm, generate_card_with_llm  # OK, если OPENAI_API_KEY есть
 
 router = Router()
