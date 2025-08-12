@@ -1,10 +1,11 @@
 
 import json
 from aiogram import Router, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove, KeyboardButton
+from aiogram.filters import Command
+from aiogram.types import Message, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from app.keyboards.common import main_kb, ai_entry_kb
+from app.keyboards.common import main_kb
+from app.keyboards.menus import main_menu_kb
 from app.services.stats import get_stats, format_activity
 
 ADMIN_IDS = {1294415669}
@@ -71,11 +72,10 @@ def contact_kb():
         KeyboardButton(text="Отправить номер", request_contact=True)
     ).as_markup(resize_keyboard=True)
 
-@router.message(CommandStart())
-async def cmd_start(m: Message):
+@router.message(Command("start"))
+async def start(m: Message):
     ensure_user(m.from_user)
-    await m.answer("Привет! Выбери режим:", reply_markup=main_kb(m.from_user.id in ADMIN_IDS))
-    await m.answer("Чтобы задать вопрос или найти бренд, нажмите кнопку ниже:", reply_markup=ai_entry_kb())
+    await m.answer("Главное меню", reply_markup=main_menu_kb())
 
 @router.message(F.text == "📊 Моя статистика")
 async def show_stats(m: Message):
