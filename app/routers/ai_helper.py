@@ -122,6 +122,12 @@ if not photo_url:
         img = image_search_brand((brand_guess or q) + " bottle label")
         if isinstance(img, dict):
             photo_url = img.get("contentUrl") or img.get("contextLink")
+if photo_url:
+    try:
+        from app.services.brands import set_image_url_for_brand
+        set_image_url_for_brand(brand_guess or q, photo_url)
+    except Exception:
+        pass
 
 try:
     if photo_url:
@@ -130,6 +136,7 @@ try:
         await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 except TelegramBadRequest:
     await m.answer(caption, reply_markup=menu_ai_exit_kb())
+
 
 # =========================
 # Состояние AI-режима / антиспам
