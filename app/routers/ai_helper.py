@@ -25,12 +25,11 @@ from app.services.sales_intents import detect_sales_intent
 # ---- локальная база (JSON) ----
 from app.services.brands import exact_lookup, get_brand, fuzzy_suggest
 try:
-    # если добавлял "умный" поиск (возраст/финиш), используем его
     from app.services.brands import smart_lookup as _smart_lookup
 except Exception:
     _smart_lookup = None
 
-# ---- KB / RAG (необязательно — пропустим, если нет) ----
+# ---- KB / RAG (опционально) ----
 try:
     from app.services.knowledge import retrieve as kb_retrieve
 except Exception:
@@ -42,7 +41,7 @@ except Exception:
     kb_find_record = None
     def build_caption_from_kb(_): return ""
 
-# ---- веб-поиск / картинки ----
+# ---- веб-поиск / картинки (синхронные функции!) ----
 from app.services.ai_google import web_search_brand, image_search_brand
 
 # ---- LLM (опционально) ----
@@ -62,7 +61,6 @@ router = Router()
 # Состояние AI-режима / антиспам
 # =========================
 AI_USERS: set[int] = set()
-
 _USER_LOCKS: dict[int, asyncio.Lock] = {}
 _USER_LAST: dict[int, float] = {}
 _COOLDOWN = 4.0  # сек между запросами
@@ -81,7 +79,7 @@ def _mark_used(uid: int):
     _USER_LAST[uid] = time.time()
 
 # =========================
-# Клавиатуры и тексты (берём из menus.py!)
+# Клавиатуры и тексты (берём из menus.py)
 # =========================
 try:
     from app.keyboards.menus import (
@@ -90,7 +88,6 @@ try:
         ai_exit_inline_kb as menu_ai_exit_kb,
     )
 except Exception:
-    # Фолбэк, если файл переименуют
     MENU_AI_ENTRY = "AI эксперт 🤖"
     MENU_AI_EXIT  = "Выйти из AI режима"
     def menu_ai_exit_kb() -> InlineKeyboardMarkup:
@@ -109,21 +106,16 @@ _ALLOWED_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "br"}
 def _sanitize_caption(html: str, limit: int = 1000) -> str:
     if not html:
         return ""
-    # выпиливаем запретные теги
     html = re.sub(r"</?(?:h[1-6]|p|ul|ol|li)>", "", html, flags=re.I)
-    # strong/em -> b/i
     html = re.sub(r"<\s*strong\s*>", "<b>", html, flags=re.I)
     html = re.sub(r"<\s*/\s*strong\s*>", "</b>", html, flags=re.I)
     html = re.sub(r"<\s*em\s*>", "<i>", html, flags=re.I)
     html = re.sub(r"<\s*/\s*em\s*>", "</i>", html, flags=re.I)
-    # убираем любые другие теги
     def _strip_tag(m):
         tag = m.group(1).lower()
         return m.group(0) if tag in _ALLOWED_TAGS else ""
     html = re.sub(r"</?([a-z0-9]+)(?:\s+[^>]*)?>", _strip_tag, html)
-    # сжать пустые строки
     html = re.sub(r"\n{3,}", "\n\n", html).strip()
-    # ограничить длину
     if len(html) > limit:
         html = html[:limit-1].rstrip() + "…"
     return html
@@ -151,7 +143,6 @@ def _normalize_text(s: str) -> str:
     return s
 
 def _kb_brand_names() -> list[str]:
-    """Список брендов из data/brands_kb.json (если есть)."""
     try:
         from pathlib import Path
         import json
@@ -174,13 +165,9 @@ def _kb_brand_names() -> list[str]:
         return []
 
 def _guess_brand(q: str) -> Optional[str]:
-    """Пробуем сопоставить запрос бренду: JSON (точно/умно) → KB."""
-    # 1) точный матч по JSON
     e = exact_lookup(q)
     if e:
         return e
-
-    # 2) «умный» поиск (если есть) или fuzzy
     if _smart_lookup:
         try:
             s = _smart_lookup(q)
@@ -195,17 +182,13 @@ def _guess_brand(q: str) -> Optional[str]:
                 return cand[0][0]
         except Exception:
             pass
-
-    # 3) KB-имена (если файл есть)
     cand = _kb_brand_names()
     if not cand:
         return None
-
     norm = _normalize_text(q).lower()
     for name in cand:
         if name.lower() in norm or norm in name.lower():
             return name
-
     match = difflib.get_close_matches(norm, [c.lower() for c in cand], n=1, cutoff=0.72)
     if match:
         lower2real = {c.lower(): c for c in cand}
@@ -213,7 +196,7 @@ def _guess_brand(q: str) -> Optional[str]:
     return None
 
 # =========================
-# Вход/выход из AI-режима (реагируем и на реплай, и на callback)
+# Вход/выход из AI-режима
 # =========================
 @router.message(F.text == AI_ENTRY_TEXT)
 @router.message(F.text == "/ai")
@@ -226,7 +209,7 @@ async def ai_mode_msg(m: Message):
         reply_markup=menu_ai_exit_kb(),
     )
 
-@router.callback_query(F.data == "ai:enter")   # на будущее: если сделаешь inline-вход
+@router.callback_query(F.data == "ai:enter")
 async def ai_mode_cb(cb: CallbackQuery):
     AI_USERS.add(cb.from_user.id)
     with suppress(Exception):
@@ -240,7 +223,7 @@ async def ai_mode_cb(cb: CallbackQuery):
 
 @router.message(F.text == AI_EXIT_TEXT)
 @router.message(F.text == "/ai_off")
-@router.callback_query(F.data.in_({"ai:exit", "ai_exit"}))  # поддержим оба варианта
+@router.callback_query(F.data.in_({"ai:exit", "ai_exit"}))
 async def ai_mode_off(ev):
     user_id = ev.from_user.id if hasattr(ev, "from_user") else ev.message.from_user.id
     AI_USERS.discard(user_id)
@@ -253,21 +236,18 @@ async def ai_mode_off(ev):
         await ev.answer("AI-режим выключен.")
 
 # =========================
-# Главный AI-хендлер (работает только в AI-режиме)
+# Главный AI-хендлер
 # =========================
 @router.message(lambda m: m.from_user.id in AI_USERS and m.text is not None)
 async def handle_ai(m: Message):
-    # антиспам: по одному запросу и кулдаун
     lock = _user_lock(m.from_user.id)
     if lock.locked():
         await m.answer("Уже отвечаю на предыдущий запрос…")
         return
-
     left = _cooldown_left(m.from_user.id)
     if left > 0.1:
         await m.answer(f"Подождите {left:.0f} сек…")
         return
-
     async with lock:
         _mark_used(m.from_user.id)
         await _answer_ai(m, m.text.strip())
@@ -278,19 +258,18 @@ async def _answer_ai(m: Message, text: str):
         await m.answer("Напишите запрос или название бренда.")
         return
 
-    # «печатает…»
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
     t0 = time.monotonic()
 
     try:
-        # 0) sales-интент?
+        # 0) «как продавать …»
         outlet = detect_sales_intent(q)
         if outlet:
             await _answer_sales(m, q, outlet, stop_typing, typing_task, t0)
             return
 
-        # 1) локальная карточка JSON (точный/умный матч)
+        # 1) Локальная JSON карточка
         name = _smart_lookup(q) if _smart_lookup else None
         if not name:
             name = exact_lookup(q)
@@ -307,7 +286,7 @@ async def _answer_ai(m: Message, text: str):
             item = get_brand(name)
             if item:
                 caption = _sanitize_caption(item["caption"])
-                photo_id = item.get("photo_file_id")
+                photo_id = item.get("photo_file_id") or item.get("image_url")
 
                 try:
                     if photo_id:
@@ -334,7 +313,7 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] local card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 2) KB-first: прямая карточка из brands_kb.json
+        # 2) KB-first
         brand_guess = _guess_brand(q)
         if kb_find_record:
             try:
@@ -358,7 +337,6 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] kb direct card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 2b) KB → LLM карточка
         if kb_retrieve and generate_caption_with_gemini:
             try:
                 kb = kb_retrieve(q, brand=brand_guess, top_k=8)
@@ -382,11 +360,13 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] kb gemini card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 3) Веб → (LLM или фолбэк) + картинка
+        # 3) ВЕБ → (LLM или фолбэк) + картинка
         with suppress(Exception):
             ai_inc("ai.query", tags={"intent": "brand"})
+
+        # ВАЖНО: web_search_brand и image_search_brand — синхронные!
         try:
-            results = await web_search_brand(q)
+            results = web_search_brand(q)   # без await
         except Exception:
             results = {}
 
@@ -399,7 +379,6 @@ async def _answer_ai(m: Message, text: str):
             caption = ""
 
         if not caption:
-            # простой фолбэк без LLM
             items = (results or {}).get("results", [])
             lines = []
             if brand_guess:
@@ -409,17 +388,19 @@ async def _answer_ai(m: Message, text: str):
                 snip = r.get("snippet") or ""
                 if name:
                     lines.append(f"• {name} — {snip}")
-            caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл."
+            caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе."
 
         caption = _sanitize_caption(caption)
 
-        photo = None
+        # Картинка: берём URL из dict
+        img = None
         with suppress(Exception):
-            photo = await image_search_brand((brand_guess or q) + " bottle label")
+            img = image_search_brand((brand_guess or q) + " bottle label")   # без await
+        photo_url = img.get("contentUrl") if isinstance(img, dict) else img
 
         try:
-            if photo:
-                await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+            if photo_url:
+                await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
             else:
                 await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
         except TelegramBadRequest:
@@ -440,7 +421,7 @@ async def _answer_ai(m: Message, text: str):
             await typing_task
 
 # =========================
-# Sales-интент (короткий «плейбук»)
+# Sales-интент
 # =========================
 async def _answer_sales(
     m: Message,
