@@ -2,12 +2,15 @@
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
+from aiogram.enums import ChatAction  # typing-индикатор
 import logging
 import time
 import re  # для санитайзера
-import difflib   # NEW: для лёгкого фзи-матча бренда
-import json      # NEW
-from pathlib import Path  # NEW
+import difflib
+import json
+import asyncio
+from pathlib import Path
+from contextlib import suppress
 
 from app.keyboards.menus import (
     AI_ENTRY_BUTTON_TEXT,
@@ -15,6 +18,8 @@ from app.keyboards.menus import (
     main_menu_kb,
     ai_exit_inline_kb,
 )
+
+log = logging.getLogger(__name__)
 
 # === Санитайзер HTML под Telegram ===
 def _sanitize_caption(html: str) -> str:
@@ -68,12 +73,12 @@ except Exception:
     kb_retrieve = None
 
 router = Router()
-log = logging.getLogger(__name__)
 
-# Пользователи в AI-режиме
+# =========================
+# Кэш CSE и антиспам/очередь
+# =========================
 AI_USERS: set[int] = set()
 
-# Простой кэш результатов поиска, чтобы экономить квоту CSE
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 60 * 30  # 30 минут
 
@@ -89,6 +94,38 @@ def _cache_get(key: str):
 
 def _cache_set(key: str, data: dict) -> None:
     _CACHE[key] = (time.time(), data)
+
+_USER_LOCKS: dict[int, asyncio.Lock] = {}
+_LAST_AT: dict[int, float] = {}
+_COOLDOWN_SEC = 4.0  # минимальная пауза между запросами
+
+def _user_lock(uid: int) -> asyncio.Lock:
+    lock = _USER_LOCKS.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_LOCKS[uid] = lock
+    return lock
+
+def _too_soon(uid: int) -> float:
+    now = time.monotonic()
+    last = _LAST_AT.get(uid, 0.0)
+    left = _COOLDOWN_SEC - (now - last)
+    return left if left > 0 else 0.0
+
+def _mark_used(uid: int):
+    _LAST_AT[uid] = time.monotonic()
+
+async def _typing_pulse(bot, chat_id: int, stop: asyncio.Event, period: float = 4.0):
+    try:
+        while not stop.is_set():
+            with suppress(Exception):
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=period)
+            except asyncio.TimeoutError:
+                continue
+    except Exception:
+        pass
 
 # === BRAND GUESS (безопасно, работает даже если KB отсутствует) ===
 def _kb_brand_names() -> list[str]:
@@ -180,107 +217,159 @@ async def ai_any_text(m: Message):
     if not q:
         return
 
-    log.info("[AI] user=%s query=%r", m.from_user.id, q)
-
-    # 0) Продажный интент: “как продать …”
-    sale = detect_sales_intent(q)
-    if sale and have_gemini():
-        brand_guess = _guess_brand(q)  # лучше угадывать с опечатками
-        raw = await generate_sales_playbook_with_gemini(q, sale.get("outlet"), brand_guess)
-        text = _sanitize_caption(raw)
-        try:
-            await m.answer(text, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
-        except Exception:
-            await m.answer(text, reply_markup=ai_exit_inline_kb())
+    # антиспам: кулдаун
+    left = _too_soon(m.from_user.id)
+    if left > 0:
+        with suppress(Exception):
+            await m.answer(f"Чуть-чуть погодите {left:.0f} сек…")
         return
 
-    # 1) локальная карточка из твоей базы (если точный матч)
-    name = exact_lookup(q)
-    if name:
-        item = get_brand(name)
-        caption = _sanitize_caption(item["caption"])
-        try:
-            await m.answer_photo(
-                photo=item["photo_file_id"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=ai_exit_inline_kb(),
-            )
-        except Exception:
-            await m.answer_photo(
-                photo=item["photo_file_id"],
-                caption=caption,
-                reply_markup=ai_exit_inline_kb(),
-            )
-        return
+    async with _user_lock(m.from_user.id):
+        _mark_used(m.from_user.id)
+        t0 = time.monotonic()
+        log.info("[AI] user=%s query=%r", m.from_user.id, q)
 
-    # 2) Иначе — пробуем KB-first (если есть ретривер), потом — Google CSE
-    await m.answer("Ищу данные и готовлю карточку…")
-    try:
-        brand_guess = _guess_brand(q)
+        # фон: «печатает…»
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_pulse(m.bot, m.chat.id, stop_typing))
 
-        # --- KB-first (опционально) ---
-        caption: str | None = None
-        if kb_retrieve:
+        # 0) Продажный интент: “как продать …”
+        sale = detect_sales_intent(q)
+        if sale and have_gemini():
             try:
-                kb_chunks = kb_retrieve(q, brand=brand_guess, top_k=8) if brand_guess else kb_retrieve(q, brand=None, top_k=8)
-            except Exception as e:
-                log.warning("[AI] kb_retrieve error: %s", e)
-                kb_chunks = None
-            if kb_chunks and have_gemini():
-                raw = await generate_caption_with_gemini(q, kb_chunks)
-                caption = _sanitize_caption(raw)
+                html = await asyncio.wait_for(
+                    generate_sales_playbook_with_gemini(q, sale.get("outlet"), _guess_brand(q)),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                html = "<b>Долго думаем…</b>\n• Попробуйте уточнить запрос или повторить позже."
+            text = _sanitize_caption(html)
+            with suppress(Exception):
+                await m.answer(text, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+            stop_typing.set()
+            with suppress(Exception):
+                await typing_task
+            log.info("[AI] sales playbook in %.2fs", time.monotonic() - t0)
+            return
 
-        # --- Веб-поиск, если KB не дал результата ---
-        if not caption:
-            results = _cache_get(q)
-            if results is None:
-                results = web_search_brand(q)  # внутри можешь ограничить белый список доменов
-                _cache_set(q, results)
-
-            if have_gemini():
-                raw = await generate_caption_with_gemini(q, results)
-            else:
-                raw = build_caption_from_results(q, results)
-            caption = _sanitize_caption(raw)
-
-        # Картинка (если у тебя в ai_google ограничено на Wikipedia — это применится здесь автоматически)
-        search_image_query = (brand_guess or q) + " бутылка бренд алкоголь label"
-        img = image_search_brand(search_image_query)
-
-        try:
-            if img and img.get("contentUrl"):
+        # 1) локальная карточка из твоей базы (если точный матч)
+        name = exact_lookup(q)
+        if name:
+            item = get_brand(name)
+            caption = _sanitize_caption(item["caption"])
+            with suppress(Exception):
                 await m.answer_photo(
-                    photo=img["contentUrl"],
+                    photo=item["photo_file_id"],
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=ai_exit_inline_kb(),
                 )
-            else:
-                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
-        except Exception:
-            # fallback без parse_mode на случай «unsupported start tag»
-            if img and img.get("contentUrl"):
-                await m.answer_photo(
-                    photo=img["contentUrl"],
-                    caption=caption,
-                    reply_markup=ai_exit_inline_kb(),
-                )
-            else:
-                await m.answer(caption, reply_markup=ai_exit_inline_kb())
+            stop_typing.set()
+            with suppress(Exception):
+                await typing_task
+            log.info("[AI] local card in %.2fs", time.monotonic() - t0)
+            return
 
-    except FetchError as e:
-        log.warning("[AI] fetch error: %s", e)
-        # Если поиск упал, но Gemini есть — сгенерируем карточку без источников (минимальный JSON в ai_gemini)
-        if have_gemini():
-            raw = await generate_caption_with_gemini(q, results_or_chunks=None)
-            caption = _sanitize_caption(raw)
+        # 2) Иначе — пробуем KB-first (если есть ретривер), потом — Google CSE
+        status_msg = None
+        with suppress(Exception):
+            status_msg = await m.answer("Ищу в интернете и готовлю карточку…")
+
+        try:
+            brand_guess = _guess_brand(q)
+
+            # --- KB-first (опционально) ---
+            caption: str | None = None
+            kb_chunks = None
+            if kb_retrieve:
+                try:
+                    kb_chunks = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: kb_retrieve(q, brand=brand_guess, top_k=8)
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception as e:
+                    log.warning("[AI] kb_retrieve error: %s", e)
+                    kb_chunks = None
+
+            if kb_chunks and have_gemini():
+                try:
+                    raw = await asyncio.wait_for(generate_caption_with_gemini(q, kb_chunks), timeout=30.0)
+                except asyncio.TimeoutError:
+                    raw = ""
+                caption = _sanitize_caption(raw)
+
+            # --- Веб-поиск, если KB не дал результата ---
+            if not caption:
+                results = _cache_get(q)
+                if results is None:
+                    try:
+                        results = await asyncio.wait_for(
+                            asyncio.to_thread(web_search_brand, q),
+                            timeout=15.0
+                        )
+                    except asyncio.TimeoutError:
+                        results = {"results": []}
+                    _cache_set(q, results)
+
+                if have_gemini():
+                    try:
+                        raw = await asyncio.wait_for(generate_caption_with_gemini(q, results), timeout=35.0)
+                    except asyncio.TimeoutError:
+                        raw = ""
+                else:
+                    raw = build_caption_from_results(q, results)
+                caption = _sanitize_caption(raw or f"<b>{q}</b>\n• Короткая сводка недоступна.")
+
+            # Картинка (если у тебя в ai_google ограничено на Wikipedia — это применится здесь автоматически)
+            img = None
             try:
-                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
-            except Exception:
-                await m.answer(caption, reply_markup=ai_exit_inline_kb())
-        else:
-            await m.answer(
-                "Не получилось получить данные из интернета. Попробуй другой запрос.",
-                reply_markup=ai_exit_inline_kb(),
-            )
+                img = await asyncio.wait_for(
+                    asyncio.to_thread(image_search_brand, (brand_guess or q) + " бутылка бренд алкоголь label"),
+                    timeout=8.0
+                )
+            except asyncio.TimeoutError:
+                img = None
+
+            # удалить «Ищу…» и отдать ответ
+            with suppress(Exception):
+                if status_msg:
+                    await status_msg.delete()
+
+            with suppress(Exception):
+                if img and img.get("contentUrl"):
+                    await m.answer_photo(
+                        photo=img["contentUrl"],
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=ai_exit_inline_kb(),
+                    )
+                else:
+                    await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+
+        except FetchError as e:
+            log.warning("[AI] fetch error: %s", e)
+            with suppress(Exception):
+                if status_msg:
+                    await status_msg.delete()
+
+            if have_gemini():
+                try:
+                    raw = await asyncio.wait_for(generate_caption_with_gemini(q, results_or_chunks=None), timeout=25.0)
+                except asyncio.TimeoutError:
+                    raw = ""
+                caption = _sanitize_caption(raw or f"<b>{q}</b>\n• Не удалось получить данные из интернета.")
+                with suppress(Exception):
+                    await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+            else:
+                with suppress(Exception):
+                    await m.answer(
+                        "Не получилось получить данные из интернета. Попробуй другой запрос.",
+                        reply_markup=ai_exit_inline_kb(),
+                    )
+        finally:
+            stop_typing.set()
+            with suppress(Exception):
+                await typing_task
+            log.info("[AI] finished in %.2fs", time.monotonic() - t0)
