@@ -1,13 +1,15 @@
 # app/services/brands.py
-# Поддержка JSON в виде СПИСКА [{...}, {...}] и/или словаря {name: {...}}
+# Поддержка JSON в виде СПИСКА карточек [{...}, {...}] или словаря {name: {...}}
 from __future__ import annotations
 import json, re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from difflib import SequenceMatcher
 
+# Где искать базу
 SOURCE_FILES = [Path("data/catalog.json"), Path("data/brands_kb.json")]
 
+# ---------- загрузка базы ----------
 def _load_raw() -> List[Dict[str, Any]]:
     for p in SOURCE_FILES:
         if p.exists():
@@ -17,7 +19,9 @@ def _load_raw() -> List[Dict[str, Any]]:
                 items: List[Dict[str, Any]] = []
                 for k, v in data.items():
                     if isinstance(v, dict):
-                        d = dict(v); d.setdefault("brand", k); items.append(d)
+                        d = dict(v)
+                        d.setdefault("brand", k)
+                        items.append(d)
                 print(f"[brands] Loaded {len(items)} items from {p} (dict)")
                 return items
             elif isinstance(data, list):
@@ -32,32 +36,102 @@ def _load_raw() -> List[Dict[str, Any]]:
 
 RAW: List[Dict[str, Any]] = _load_raw()
 
-def _norm(s: str) -> str:
-    s = (s or "").lower().strip().replace("’", "'")
+# ---------- нормализация ----------
+def _norm_keep_numbers(s: str) -> str:
+    """Нормализация с сохранением цифр (нужна для алиасов с 12/14/18 и т.п.)."""
+    s = (s or "").lower().strip()
+    s = s.replace("’", "'")
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\b(\d+[.,]?\d*)\s*(l|л|литр(а|ов)?|ml|мл)\b", " ", s)  # литражи
-    s = re.sub(r"\b(0\.\d+|[1-9]\d*)\b", " ", s)                         # «голые» числа
-    return re.sub(r"\s+", " ", s).strip()
+    # убираем только объёмы/единицы, а ЦИФРЫ возраста оставляем
+    s = re.sub(r"\b(\d+[.,]?\d*)\s*(l|л|литр(а|ов)?|ml|мл)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-NAME_INDEX: Dict[str, Dict[str, Any]] = {}
-ALIASES: Dict[str, str] = {}
-ALL_CANON: List[str] = []
+def _norm(s: str) -> str:
+    """Базовая нормализация (без цифр). Подходит для каноничных имен и свободного ввода."""
+    s = _norm_keep_numbers(s)
+    # убрать «голые» числа (0.7, 12 и т.д.)
+    s = re.sub(r"\b(0\.\d+|[1-9]\d*)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# ---------- индексация ----------
+NAME_INDEX: Dict[str, Dict[str, Any]] = {}   # norm(бренд без цифр) -> запись
+ALIASES_NUM: Dict[str, str] = {}             # norm_keep_numbers(алиас) -> канон. имя бренда (с цифрами!)
+ALIASES: Dict[str, str] = {}                 # norm(алиас без цифр) -> канон. имя бренда
+ALL_CANON: List[str] = []                    # список каноничных имён
+
+# Корневые алиасы (короткие запросы одним словом)
+ROOT_ALIASES: Dict[str, str] = {
+    _norm_keep_numbers("грантс"): "Grant's Triple Wood",
+    _norm_keep_numbers("grant's"): "Grant's Triple Wood",
+    _norm_keep_numbers("grants"): "Grant's Triple Wood",
+
+    _norm_keep_numbers("тулламор"): "Tullamore D.E.W. Original",
+    _norm_keep_numbers("tullamore"): "Tullamore D.E.W. Original",
+
+    _norm_keep_numbers("гленфиддик"): "Glenfiddich 12 Year Old",
+    _norm_keep_numbers("glenfiddich"): "Glenfiddich 12 Year Old",
+
+    _norm_keep_numbers("балвени"): "The Balvenie 12 Year Old DoubleWood",
+    _norm_keep_numbers("balvenie"): "The Balvenie 12 Year Old DoubleWood",
+
+    _norm_keep_numbers("монки"): "Monkey Shoulder Blended Malt",
+    _norm_keep_numbers("шолдер"): "Monkey Shoulder Blended Malt",
+    _norm_keep_numbers("monkey shoulder"): "Monkey Shoulder Blended Malt",
+
+    _norm_keep_numbers("хендрикс"): "Hendrick's Gin",
+    _norm_keep_numbers("hendricks"): "Hendrick's Gin",
+    _norm_keep_numbers("hendrick's"): "Hendrick's Gin",
+
+    _norm_keep_numbers("драмбуи"): "Drambuie",
+    _norm_keep_numbers("drambuie"): "Drambuie",
+
+    _norm_keep_numbers("рейка"): "Reyka Vodka",
+    _norm_keep_numbers("reyka"): "Reyka Vodka",
+
+    _norm_keep_numbers("милагро"): "Milagro Silver",
+    _norm_keep_numbers("milagro"): "Milagro Silver",
+
+    _norm_keep_numbers("аэрстоун"): "Aerstone 10 Year Old Sea Cask",
+    _norm_keep_numbers("aerstone"): "Aerstone 10 Year Old Sea Cask",
+
+    _norm_keep_numbers("сейлор джерри"): "Sailor Jerry Spiced Rum",
+    _norm_keep_numbers("сейлор"): "Sailor Jerry Spiced Rum",
+    _norm_keep_numbers("джерри"): "Sailor Jerry Spiced Rum",
+    _norm_keep_numbers("sailor jerry"): "Sailor Jerry Spiced Rum",
+}
 
 def _build_indexes() -> None:
-    NAME_INDEX.clear(); ALIASES.clear(); ALL_CANON.clear()
+    NAME_INDEX.clear(); ALIASES.clear(); ALIASES_NUM.clear(); ALL_CANON.clear()
     for entry in RAW:
         brand = (entry.get("brand") or "").strip()
-        if not brand: continue
+        if not brand:
+            continue
         key = _norm(brand)
         NAME_INDEX[key] = entry
         ALL_CANON.append(brand)
+
+        # алиасы с цифрами (сначала)
+        for alias in entry.get("aliases", []) or []:
+            akey_num = _norm_keep_numbers(alias)
+            if akey_num and akey_num not in ALIASES_NUM:
+                ALIASES_NUM[akey_num] = brand
+
+        # алиасы без цифр (вторым слоем)
         for alias in entry.get("aliases", []) or []:
             akey = _norm(alias)
-            if akey and akey not in NAME_INDEX:
+            if akey and akey not in NAME_INDEX and akey not in ALIASES:
                 ALIASES[akey] = brand
+
+    # Добавим корневые алиасы, если такие бренды действительно есть
+    for k, canon in list(ROOT_ALIASES.items()):
+        if _norm(canon) in NAME_INDEX:
+            ALIASES_NUM.setdefault(k, canon)
 
 _build_indexes()
 
+# ---------- помощники ----------
 def _build_caption(entry: Dict[str, Any]) -> str:
     brand   = entry.get("brand", "")
     cat     = entry.get("category", "")
@@ -78,58 +152,89 @@ def _build_caption(entry: Dict[str, Any]) -> str:
 
     caption = "\n".join(parts)
     caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
-    if len(caption) > 1000: caption = caption[:997] + "…"
+    if len(caption) > 1000:
+        caption = caption[:997] + "…"
     return caption
 
 def _similar(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
-# -------- Публичный интерфейс (как у тебя в коде) --------
+# ---------- ПУБЛИЧНОЕ API ----------
 def exact_lookup(text: str) -> Optional[str]:
+    """Ищем в 4 шага: NAME_INDEX -> ALIASES_NUM -> ROOT_ALIASES -> ALIASES."""
+    key_num = _norm_keep_numbers(text)
+    if key_num in NAME_INDEX:
+        return NAME_INDEX[key_num].get("brand")
+    if key_num in ALIASES_NUM:
+        return ALIASES_NUM[key_num]
+    if key_num in ROOT_ALIASES:
+        return ROOT_ALIASES[key_num]
+
     key = _norm(text)
-    if key in NAME_INDEX: return NAME_INDEX[key].get("brand")
-    if key in ALIASES:    return ALIASES[key]
+    if key in NAME_INDEX:
+        return NAME_INDEX[key].get("brand")
+    if key in ALIASES:
+        return ALIASES[key]
     return None
 
 def get_brand(name: str) -> Optional[Dict[str, Any]]:
     canon = exact_lookup(name) or name
     entry = NAME_INDEX.get(_norm(canon))
-    if not entry: return None
+    if not entry:
+        return None
     return {
         "name": entry.get("brand", canon),
         "caption": _build_caption(entry),
         "photo_file_id": entry.get("photo_file_id"),  # может быть None
+        "image_url": entry.get("image_url"),          # опционально, если добавишь
         "category": entry.get("category", "")
     }
 
 def by_category(cat_query: str, limit: int = 50) -> List[str]:
-    q = _norm(cat_query); out: List[str] = []
+    q = _norm(cat_query)
+    out: List[str] = []
     for entry in NAME_INDEX.values():
         cat = _norm(entry.get("category", ""))
         if q and q in cat:
-            b = entry.get("brand"); 
-            if b: 
+            b = entry.get("brand")
+            if b:
                 out.append(b)
-                if len(out) >= limit: break
+                if len(out) >= limit:
+                    break
     return sorted(set(out))
 
 def fuzzy_suggest(text: str, limit: int = 10) -> List[Tuple[str, float]]:
     t = (text or "").strip()
-    if not t: return []
+    if not t:
+        return []
+    t_norm_num = _norm_keep_numbers(t)
     t_norm = _norm(t)
-    candidates = set(ALL_CANON); candidates.update(ALIASES.values())
 
-    hits = [(c, 1.0) for c in candidates if t_norm and t_norm in _norm(c)]
+    candidates = set(ALL_CANON)
+    for _, canon in ALIASES.items():
+        candidates.add(canon)
+    for _, canon in ALIASES_NUM.items():
+        candidates.add(canon)
+
+    # быстрые подстрочные попадания (и с цифрами, и без)
+    hits = [(c, 1.0) for c in candidates if (t_norm and t_norm in _norm(c)) or (t_norm_num and t_norm_num in _norm_keep_numbers(c))]
+
+    # похожесть
     scored: List[Tuple[str, float]] = []
     for c in candidates:
-        s = _similar(t.lower(), c.lower())
-        if s >= 0.6: scored.append((c, s))
+        s1 = _similar(t_norm_num, _norm_keep_numbers(c))
+        s2 = _similar(t_norm, _norm(c))
+        s = max(s1, s2)
+        if s >= 0.6:
+            scored.append((c, s))
 
     by_name: Dict[str, float] = {n: s for n, s in scored}
-    for n, s in hits: by_name[n] = max(by_name.get(n, 0.0), s)
+    for n, s in hits:
+        by_name[n] = max(by_name.get(n, 0.0), s)
+
     return sorted(by_name.items(), key=lambda x: x[1], reverse=True)[:limit]
 
-# -------- Русские синонимы (если где-то так импортируешь) --------
+# ---------- РУССКИЕ СИНОНИМЫ (если где-то импорт русскими именами) ----------
 по_категории = by_category
 точный_поиск = exact_lookup
 нечеткий_подсказка = fuzzy_suggest
