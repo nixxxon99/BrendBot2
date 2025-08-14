@@ -19,8 +19,15 @@ from app.keyboards.menus import (
     ai_exit_inline_kb,
 )
 
-# NEW: метрики
-from app.stats import ai_inc, ai_observe_ms
+# === Метрики (опционально) ===
+try:
+    from app.services.stats import ai_inc, ai_observe_ms
+except Exception:
+    # no-op заглушки, чтобы код не падал, если stats недоступен
+    def ai_inc(*args, **kwargs):
+        return None
+    def ai_observe_ms(*args, **kwargs):
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -182,7 +189,6 @@ def _guess_brand(q: str) -> str | None:
 @router.message(F.text == AI_ENTRY_BUTTON_TEXT)
 async def enter_ai_by_button(m: Message):
     AI_USERS.add(m.from_user.id)
-    # метрика входа
     ai_inc("ai.enter", tags={"how": "button"})
     await m.answer(
         "AI-режим включён. Напишите название бренда или вопрос.",
@@ -192,7 +198,6 @@ async def enter_ai_by_button(m: Message):
 @router.message(Command("ai"))
 async def enter_ai_cmd(m: Message):
     AI_USERS.add(m.from_user.id)
-    # метрика входа
     ai_inc("ai.enter", tags={"how": "command"})
     await m.answer(
         "AI-режим включён. Напишите название бренда или вопрос.",
@@ -202,7 +207,6 @@ async def enter_ai_cmd(m: Message):
 @router.callback_query(F.data == "ai:exit")
 async def exit_ai_cb(c: CallbackQuery):
     AI_USERS.discard(c.from_user.id)
-    # метрика выхода
     ai_inc("ai.exit", tags={"how": "inline"})
     await c.message.answer(
         "AI-режим выключен. Вы в главном меню.",
@@ -214,7 +218,6 @@ async def exit_ai_cb(c: CallbackQuery):
 @router.message(Command("ai_off"))
 async def exit_ai_cmd(m: Message):
     AI_USERS.discard(m.from_user.id)
-    # метрика выхода
     ai_inc("ai.exit", tags={"how": "command"})
     await m.answer(
         "AI-режим выключен. Вы в главном меню.",
