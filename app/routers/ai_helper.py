@@ -81,16 +81,25 @@ def _mark_used(uid: int):
     _USER_LAST[uid] = time.time()
 
 # =========================
-# Клавиатуры и тексты
+# Клавиатуры и тексты (берём из menus.py!)
 # =========================
-# В твоём UI вход — inline-кнопка с callback_data="ai:enter" и текстом "🤖 AI-помощник".
-AI_ENTRY_TEXT = "🤖 AI-помощник"
-AI_EXIT_TEXT  = "Выйти из AI режима"  # текст для кнопки выхода (если понадобится как message)
-
-def ai_exit_inline_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=AI_EXIT_TEXT, callback_data="ai:exit")]]
+try:
+    from app.keyboards.menus import (
+        AI_ENTRY_BUTTON_TEXT as MENU_AI_ENTRY,
+        AI_EXIT_BUTTON_TEXT as MENU_AI_EXIT,
+        ai_exit_inline_kb as menu_ai_exit_kb,
     )
+except Exception:
+    # Фолбэк, если файл переименуют
+    MENU_AI_ENTRY = "AI эксперт 🤖"
+    MENU_AI_EXIT  = "Выйти из AI режима"
+    def menu_ai_exit_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=MENU_AI_EXIT, callback_data="ai:exit")]]
+        )
+
+AI_ENTRY_TEXT = MENU_AI_ENTRY
+AI_EXIT_TEXT  = MENU_AI_EXIT
 
 # =========================
 # Санитайзер для подписи Telegram
@@ -204,7 +213,7 @@ def _guess_brand(q: str) -> Optional[str]:
     return None
 
 # =========================
-# Вход/выход из AI-режима
+# Вход/выход из AI-режима (реагируем и на реплай, и на callback)
 # =========================
 @router.message(F.text == AI_ENTRY_TEXT)
 @router.message(F.text == "/ai")
@@ -214,10 +223,10 @@ async def ai_mode_msg(m: Message):
         "AI-режим включён. Напишите бренд или вопрос.\n"
         "Приоритет: <b>локальная база → KB → веб</b>.",
         parse_mode="HTML",
-        reply_markup=ai_exit_inline_kb(),
+        reply_markup=menu_ai_exit_kb(),
     )
 
-@router.callback_query(F.data == "ai:enter")
+@router.callback_query(F.data == "ai:enter")   # на будущее: если сделаешь inline-вход
 async def ai_mode_cb(cb: CallbackQuery):
     AI_USERS.add(cb.from_user.id)
     with suppress(Exception):
@@ -226,12 +235,12 @@ async def ai_mode_cb(cb: CallbackQuery):
         "AI-режим включён. Напишите бренд или вопрос.\n"
         "Приоритет: <b>локальная база → KB → веб</b>.",
         parse_mode="HTML",
-        reply_markup=ai_exit_inline_kb(),
+        reply_markup=menu_ai_exit_kb(),
     )
 
 @router.message(F.text == AI_EXIT_TEXT)
 @router.message(F.text == "/ai_off")
-@router.callback_query(F.data.in_({"ai:exit", "ai_exit"}))  # поддержим старый вариант
+@router.callback_query(F.data.in_({"ai:exit", "ai_exit"}))  # поддержим оба варианта
 async def ai_mode_off(ev):
     user_id = ev.from_user.id if hasattr(ev, "from_user") else ev.message.from_user.id
     AI_USERS.discard(user_id)
@@ -306,14 +315,14 @@ async def _answer_ai(m: Message, text: str):
                             photo=photo_id,
                             caption=caption,
                             parse_mode="HTML",
-                            reply_markup=ai_exit_inline_kb(),
+                            reply_markup=menu_ai_exit_kb(),
                         )
                     else:
-                        await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                        await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
                 except TelegramBadRequest:
                     ai_inc("ai.error", tags={"stage": "tg_parse"})
                     with suppress(Exception):
-                        await m.answer(caption, reply_markup=ai_exit_inline_kb())
+                        await m.answer(caption, reply_markup=menu_ai_exit_kb())
 
                 stop_typing.set()
                 with suppress(Exception):
@@ -335,9 +344,9 @@ async def _answer_ai(m: Message, text: str):
             if rec:
                 caption = _sanitize_caption(build_caption_from_kb(rec))
                 try:
-                    await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                    await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
                 except TelegramBadRequest:
-                    await m.answer(caption, reply_markup=ai_exit_inline_kb())
+                    await m.answer(caption, reply_markup=menu_ai_exit_kb())
 
                 stop_typing.set()
                 with suppress(Exception):
@@ -361,7 +370,7 @@ async def _answer_ai(m: Message, text: str):
                 except Exception:
                     caption = ""
                 caption = _sanitize_caption(caption) or "Нет фактов в KB."
-                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 
                 stop_typing.set()
                 with suppress(Exception):
@@ -374,8 +383,6 @@ async def _answer_ai(m: Message, text: str):
                 return
 
         # 3) Веб → (LLM или фолбэк) + картинка
-        cached_key = q  # можно усложнить ключ при желании
-        results = None
         with suppress(Exception):
             ai_inc("ai.query", tags={"intent": "brand"})
         try:
@@ -412,11 +419,11 @@ async def _answer_ai(m: Message, text: str):
 
         try:
             if photo:
-                await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
             else:
-                await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
         except TelegramBadRequest:
-            await m.answer(caption, reply_markup=ai_exit_inline_kb())
+            await m.answer(caption, reply_markup=menu_ai_exit_kb())
 
         stop_typing.set()
         with suppress(Exception):
@@ -461,9 +468,9 @@ async def _answer_sales(
 
     text = _sanitize_caption(text, limit=1000)
     try:
-        await m.answer(text, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+        await m.answer(text, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
     except TelegramBadRequest:
-        await m.answer(text, reply_markup=ai_exit_inline_kb())
+        await m.answer(text, reply_markup=menu_ai_exit_kb())
 
     stop_typing.set()
     with suppress(Exception):
