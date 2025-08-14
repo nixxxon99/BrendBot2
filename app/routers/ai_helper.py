@@ -59,87 +59,6 @@ except Exception:
 
 log = logging.getLogger(__name__)
 router = Router()
-# 4) ВЕБ → (LLM или фолбэк) + картинка
-with suppress(Exception):
-    ai_inc("ai.query", tags={"intent": "brand"})
-
-try:
-    results = web_search_brand(q)   # без await
-except Exception:
-    results = {}
-
-# === НОВОЕ: пробуем достать факты со страниц разрешённых доменов ===
-try:
-    from app.services.extractors import fetch_and_extract
-    enriched = fetch_and_extract(brand_guess or q, results, max_pages=3)
-except Exception:
-    enriched = {}
-
-caption = ""
-photo_url = None
-
-# если что-то вытащили — соберём карточку без LLM
-if enriched and (enriched.get("basics") or enriched.get("taste")):
-    name = enriched.get("name") or (brand_guess or q)
-    b = enriched.get("basics") or {}
-    lines = [f"<b>{name}</b>"]
-    meta = " | ".join([x for x in [b.get("category"), b.get("country"), b.get("abv")] if x])
-    if meta: lines.append("• " + meta)
-    if enriched.get("taste"): lines.append("• Профиль: " + enriched["taste"])
-    for fct in (enriched.get("facts") or [])[:3]:
-        if not fct.lower().startswith(("категория", "страна", "крепость")):
-            lines.append("• " + fct)
-    srcs = enriched.get("sources") or []
-    if srcs:
-        refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(srcs[:3])])
-        lines.append("Источники: " + refs)
-    caption = _sanitize_caption("\n".join(lines))
-    photo_url = enriched.get("image_url")
-
-# если не хватило фактов — пробуем LLM по результатам
-if not caption and generate_caption_with_gemini:
-    try:
-        caption = await generate_caption_with_gemini(q, results or {})
-    except Exception:
-        caption = ""
-
-# финальный фолбэк по сниппетам
-if not caption:
-    items = (results or {}).get("results", [])
-    lines = []
-    if brand_guess:
-        lines.append(f"<b>{brand_guess}</b>")
-    for r in items[:5]:
-        name_ = r.get("name") or r.get("title") or ""
-        snip = r.get("snippet") or ""
-        if name_:
-            lines.append(f"• {name_} — {snip}")
-    caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе."
-caption = _sanitize_caption(caption)
-
-# Картинка — если экстрактор не нашёл, доберём через image_search
-if not photo_url:
-    with suppress(Exception):
-        img = image_search_brand((brand_guess or q) + " бутылка этикетка")
-        if isinstance(img, dict):
-            photo_url = img.get("contentUrl") or img.get("contextLink")
-
-# === НОВОЕ: автосохранение URL в JSON (если нет фото)
-if photo_url:
-    try:
-        from app.services.brands import set_image_url_for_brand
-        set_image_url_for_brand(brand_guess or q, photo_url)
-    except Exception:
-        pass
-
-# Отправка ответа (один раз!)
-try:
-    if photo_url:
-        await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-    else:
-        await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-except TelegramBadRequest:
-    await m.answer(caption, reply_markup=menu_ai_exit_kb())
 
 # =========================
 # Состояние AI-режима / антиспам
@@ -503,14 +422,42 @@ async def _answer_ai(m: Message, text: str):
         except Exception:
             results = {}
 
-        if generate_caption_with_gemini:
+        # === Пробуем достать факты со страниц разрешённых доменов ===
+        try:
+            from app.services.extractors import fetch_and_extract
+            enriched = fetch_and_extract(brand_guess or q, results, max_pages=3)
+        except Exception:
+            enriched = {}
+
+        caption = ""
+        photo_url = None
+
+        # если что-то вытащили — соберём карточку без LLM
+        if enriched and (enriched.get("basics") or enriched.get("taste")):
+            name2 = enriched.get("name") or (brand_guess or q)
+            b = enriched.get("basics") or {}
+            lines = [f"<b>{name2}</b>"]
+            meta = " | ".join([x for x in [b.get("category"), b.get("country"), b.get("abv")] if x])
+            if meta: lines.append("• " + meta)
+            if enriched.get("taste"): lines.append("• Профиль: " + enriched["taste"])
+            for fct in (enriched.get("facts") or [])[:3]:
+                if not fct.lower().startswith(("категория", "страна", "крепость")):
+                    lines.append("• " + fct)
+            srcs = enriched.get("sources") or []
+            if srcs:
+                refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(srcs[:3])])
+                lines.append("Источники: " + refs)
+            caption = _sanitize_caption("\n".join(lines))
+            photo_url = enriched.get("image_url")
+
+        # если не хватило фактов — просим LLM по результатам
+        if not caption and generate_caption_with_gemini:
             try:
                 caption = await generate_caption_with_gemini(q, results or {})
             except Exception:
                 caption = ""
-        else:
-            caption = ""
 
+        # финальный фолбэк по сниппетам
         if not caption:
             items = (results or {}).get("results", [])
             lines = []
@@ -524,13 +471,22 @@ async def _answer_ai(m: Message, text: str):
             caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе."
         caption = _sanitize_caption(caption)
 
-        # Картинка
-        photo_url = None
-        with suppress(Exception):
-            img = image_search_brand((brand_guess or q) + " bottle label")
-            if isinstance(img, dict):
-                photo_url = img.get("contentUrl") or img.get("contextLink")
+        # Картинка — если экстрактор не нашёл, доберём через image_search
+        if not photo_url:
+            with suppress(Exception):
+                img = image_search_brand((brand_guess or q) + " бутылка этикетка")
+                if isinstance(img, dict):
+                    photo_url = img.get("contentUrl") or img.get("contextLink")
 
+        # === Автосохранение URL в JSON (если нет фото) ===
+        if photo_url:
+            try:
+                from app.services.brands import set_image_url_for_brand
+                set_image_url_for_brand(brand_guess or q, photo_url)
+            except Exception:
+                pass
+
+        # Отправка ответа (один раз!)
         try:
             if photo_url:
                 await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
