@@ -17,10 +17,12 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.types import KeyboardButton
 
 # ---- метрики / sales-интенты ----
 from app.services.stats import ai_inc, ai_observe_ms
-from app.services.sales_intents import detect_sales_intent
+from app.services.sales_intents import detect_sales_intent, suggest_any_in_category
 
 # ---- локальная база (JSON) ----
 from app.services.brands import exact_lookup, get_brand, fuzzy_suggest
@@ -42,6 +44,7 @@ except Exception:
     def build_caption_from_kb(_): return ""
 
 # ---- веб-поиск / картинки (синхронные функции!) ----
+# Если у тебя есть агрегатор web_search, можно поменять импорт на него.
 from app.services.ai_google import web_search_brand, image_search_brand
 
 # ---- LLM (опционально) ----
@@ -258,28 +261,76 @@ async def _answer_ai(m: Message, text: str):
         await m.answer("Напишите запрос или название бренда.")
         return
 
+    # ====== РАННИЕ ИНТЕНТЫ ======
+    # 1) «Как продать …»
+    is_sales, outlet, brand_for_sales = detect_sales_intent(q)
+    if is_sales:
+        html = ""
+        if generate_sales_playbook_with_gemini:
+            with suppress(Exception):
+                html = await generate_sales_playbook_with_gemini(q, outlet, brand_for_sales)
+        if not html:
+            # простой фолбэк, если LLM недоступен
+            brand_hint = brand_for_sales or _guess_brand(q) or q
+            html = (
+                f"<b>Как продавать: {brand_hint}</b>\n"
+                f"• Уточни вкус покупателя (сладость/сухость; ваниль/фрукты/дым).\n"
+                f"• Предложи хайболл или классику (Old Fashioned / Sour), без цен.\n"
+                f"• 1 фраза про происхождение/бочки как «историю бренда».\n"
+                f"• Апселл: премиальная версия; кросс-селл: подходящая закуска."
+            )
+        await m.answer(_sanitize_caption(html), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        return
+
+    # 2) «Любой/неважно какой <категория>»
+    any_res = suggest_any_in_category(q)
+    if any_res:
+        display_cat, names = any_res
+        first = names[0]
+        item = get_brand(first)
+        caption = item["caption"] if item else f"<b>{first}</b>\n• Нет локальной карточки."
+        photo_id = (item or {}).get("photo_file_id") or (item or {}).get("image_url")
+
+        if not photo_id:
+            with suppress(Exception):
+                img = image_search_brand(first + " бутылка этикетка")
+                if isinstance(img, dict):
+                    photo_id = img.get("contentUrl") or img.get("contextLink")
+
+        if photo_id:
+            await m.answer_photo(photo=photo_id, caption=_sanitize_caption(caption), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        else:
+            await m.answer(_sanitize_caption(caption), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+
+        # клавиатура с альтернативами
+        try:
+            kb = ReplyKeyboardBuilder()
+            for n in names[:10]:
+                kb.add(KeyboardButton(text=n))
+            kb.add(KeyboardButton(text="Назад"))
+            kb.adjust(2)
+            await m.answer(f"Могу предложить бренды в категории «{display_cat}»:",
+                           reply_markup=kb.as_markup(resize_keyboard=True))
+        except Exception:
+            pass
+        return
+    # ====== КОНЕЦ РАННИХ ИНТЕНТОВ ======
+
+    # индикация "печатает…"
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
     t0 = time.monotonic()
 
     try:
-        # 0) «как продавать …»
-        outlet = detect_sales_intent(q)
-        if outlet:
-            await _answer_sales(m, q, outlet, stop_typing, typing_task, t0)
-            return
-
         # 1) Локальная JSON карточка
         name = _smart_lookup(q) if _smart_lookup else None
         if not name:
             name = exact_lookup(q)
         if not name:
-            try:
+            with suppress(Exception):
                 cand = fuzzy_suggest(q, limit=1)
                 if cand and cand[0][1] >= 0.72:
                     name = cand[0][0]
-            except Exception:
-                name = None
 
         if name:
             ai_inc("ai.query", tags={"intent": "brand"})
@@ -313,7 +364,7 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] local card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 2) KB-first
+        # 2) KB-first (прямая карточка)
         brand_guess = _guess_brand(q)
         if kb_find_record:
             try:
@@ -337,6 +388,7 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] kb direct card in %.2fs", dt_ms / 1000.0)
                 return
 
+        # 3) KB → LLM (если есть)
         if kb_retrieve and generate_caption_with_gemini:
             try:
                 kb = kb_retrieve(q, brand=brand_guess, top_k=8)
@@ -360,7 +412,7 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] kb gemini card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 3) ВЕБ → (LLM или фолбэк) + картинка
+        # 4) ВЕБ → (LLM или фолбэк) + картинка
         with suppress(Exception):
             ai_inc("ai.query", tags={"intent": "brand"})
 
@@ -384,19 +436,19 @@ async def _answer_ai(m: Message, text: str):
             if brand_guess:
                 lines.append(f"<b>{brand_guess}</b>")
             for r in items[:5]:
-                name = r.get("name") or r.get("title") or ""
+                name_ = r.get("name") or r.get("title") or ""
                 snip = r.get("snippet") or ""
-                if name:
-                    lines.append(f"• {name} — {snip}")
+                if name_:
+                    lines.append(f"• {name_} — {snip}")
             caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе."
-
         caption = _sanitize_caption(caption)
 
-        # Картинка: берём URL из dict
-        img = None
+        # Картинка
+        photo_url = None
         with suppress(Exception):
-            img = image_search_brand((brand_guess or q) + " bottle label")   # без await
-        photo_url = img.get("contentUrl") if isinstance(img, dict) else img
+            img = image_search_brand((brand_guess or q) + " bottle label")
+            if isinstance(img, dict):
+                photo_url = img.get("contentUrl") or img.get("contextLink")
 
         try:
             if photo_url:
@@ -421,7 +473,7 @@ async def _answer_ai(m: Message, text: str):
             await typing_task
 
 # =========================
-# Sales-интент
+# Sales-интент (вспомогательная, если где-то пригодится)
 # =========================
 async def _answer_sales(
     m: Message,
