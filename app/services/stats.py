@@ -1,4 +1,3 @@
-
 import json
 import logging
 from datetime import datetime
@@ -32,7 +31,8 @@ def _stats_key(uid: int, period: str = "total") -> str:
 class MemoryRedis:
     def __init__(self) -> None:
         self.data: Dict[str, str] = {}
-        self.hashes: Dict[str, Dict[str, int]] = {}
+        # значения могут быть как int, так и float (для латенсий)
+        self.hashes: Dict[str, Dict[str, float]] = {}
 
     def get(self, key: str):
         return self.data.get(key)
@@ -42,9 +42,13 @@ class MemoryRedis:
 
     def hincrby(self, name: str, key: str, amount: int) -> None:
         h = self.hashes.setdefault(name, {})
-        h[key] = h.get(key, 0) + amount
+        h[key] = float(h.get(key, 0)) + int(amount)
 
-    def hgetall(self, name: str) -> Dict[str, int]:
+    def hincrbyfloat(self, name: str, key: str, amount: float) -> None:
+        h = self.hashes.setdefault(name, {})
+        h[key] = float(h.get(key, 0)) + float(amount)
+
+    def hgetall(self, name: str) -> Dict[str, float]:
         return self.hashes.get(name, {}).copy()
 
     def keys(self, pattern: str):
@@ -62,7 +66,7 @@ class MemoryRedis:
     def exists(self, key: str) -> bool:
         return key in self.data
 
-# Init Redis
+# Init Redis (если не доступен — in-memory заглушка)
 try:
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     redis.ping()
@@ -98,9 +102,9 @@ def format_activity(period: str, limit: int = 10) -> str:
             day = k.split(":")[-1]
             data = redis.hgetall(k)
             lines.append(
-                f"{day}: тесты {data.get('tests', 0)}, верю {data.get('truth', 0)}, "
-                f"ассоциации {data.get('assoc', 0)}, блиц {data.get('blitz', 0)}, "
-                f"бренды {data.get('brands', 0)}"
+                f"{day}: тесты {int(data.get('tests', 0))}, верю {int(data.get('truth', 0))}, "
+                f"ассоциации {int(data.get('assoc', 0))}, блиц {int(data.get('blitz', 0))}, "
+                f"бренды {int(data.get('brands', 0))}"
             )
         return "\n".join(lines)
     elif period == "total":
@@ -108,9 +112,9 @@ def format_activity(period: str, limit: int = 10) -> str:
         if not data:
             return ""
         return (
-            f"Всего: тесты {data.get('tests', 0)}, верю {data.get('truth', 0)}, "
-            f"ассоциации {data.get('assoc', 0)}, блиц {data.get('blitz', 0)}, "
-            f"бренды {data.get('brands', 0)}"
+            f"Всего: тесты {int(data.get('tests', 0))}, верю {int(data.get('truth', 0))}, "
+            f"ассоциации {int(data.get('assoc', 0))}, блиц {int(data.get('blitz', 0))}, "
+            f"бренды {int(data.get('brands', 0))}"
         )
     return ""
 
@@ -173,3 +177,82 @@ def record_blitz_result(user_id: int, points: int) -> int:
             best = stats["best_blitz"]
     record_history("blitz")
     return best
+
+# --- NEW: форматирование тегов для ключей метрик
+def _fmt_tags(tags: Dict[str, Any] | None) -> str:
+    if not tags:
+        return ""
+    items = sorted((str(k), str(v)) for k, v in tags.items() if v is not None)
+    return ",".join(f"{k}={v}" for k, v in items)
+
+# =========================
+# AI metrics (счётчики и средние времена)
+# =========================
+
+def _ai_count_key(period: str) -> str:
+    if period == "daily":
+        day_key = datetime.now(TZ).strftime("%Y-%m-%d")
+        return f"ai:count:daily:{day_key}"
+    return "ai:count:total"
+
+def _ai_sum_key(period: str) -> str:
+    if period == "daily":
+        day_key = datetime.now(TZ).strftime("%Y-%m-%d")
+        return f"ai:sum:daily:{day_key}"
+    return "ai:sum:total"
+
+def _ai_num_key(period: str) -> str:
+    if period == "daily":
+        day_key = datetime.now(TZ).strftime("%Y-%m-%d")
+        return f"ai:num:daily:{day_key}"
+    return "ai:num:total"
+
+def ai_inc(event: str, *, tags: Dict[str, Any] | None = None, n: int = 1) -> None:
+    """
+    Счётчик событий ИИ. Пример:
+      ai_inc("ai.enter", tags={"how": "button"})
+      ai_inc("ai.source", tags={"source": "web"})
+    Пишем и в daily, и в total.
+    """
+    field = f"{event}|{_fmt_tags(tags)}"
+    for period in ("daily", "total"):
+        key = _ai_count_key(period)
+        redis.hincrby(key, field, n)
+
+def ai_observe_ms(metric: str, value_ms: float, *, tags: Dict[str, Any] | None = None) -> None:
+    """
+    Накопление сумм и количеств для средних времен (ms).
+    Пример:
+      ai_observe_ms("ai.latency", 1432.7, tags={"intent":"brand","source":"web"})
+    """
+    field = f"{metric}|{_fmt_tags(tags)}"
+    for period in ("daily", "total"):
+        key_s = _ai_sum_key(period)
+        key_n = _ai_num_key(period)
+        # и реальный Redis, и MemoryRedis поддерживают этот метод
+        redis.hincrbyfloat(key_s, field, float(value_ms))
+        redis.hincrby(key_n, field, 1)
+
+def format_ai_stats(period: str = "daily", top: int = 20) -> str:
+    """
+    Красивый текст для /stats_ai: топ счётчиков и средние времена.
+    """
+    counts = redis.hgetall(_ai_count_key(period))
+    if counts:
+        count_items = sorted(counts.items(), key=lambda kv: int(kv[1]), reverse=True)[:top]
+        counts_str = "\n".join(f"• {k} — {int(v)}" for k, v in count_items)
+    else:
+        counts_str = "—"
+
+    sums = redis.hgetall(_ai_sum_key(period))
+    nums = redis.hgetall(_ai_num_key(period))
+    avg: list[tuple[str, float]] = []
+    for field, s in sums.items():
+        n = int(nums.get(field, 0))
+        if n > 0:
+            avg.append((field, round(float(s) / n, 1)))
+    avg.sort(key=lambda kv: kv[1])  # от самых быстрых
+    avg_str = "\n".join(f"• {k} — {v} ms" for k, v in avg[:top]) if avg else "—"
+
+    title = "Ежедневно" if period == "daily" else "Итого"
+    return f"<b>💡 AI-метрики — {title}</b>\n\n<b>События</b>:\n{counts_str}\n\n<b>Среднее время</b>:\n{avg_str}"
