@@ -76,11 +76,18 @@ from app.services.ai_gemini import have_gemini, generate_caption_with_gemini
 from app.services.sales_intents import detect_sales_intent
 from app.services.ai_gemini import generate_sales_playbook_with_gemini
 
-# NEW (опционально): локальный RAG-ретривер. Если нет — просто игнорируется.
+# NEW (опционально): локальный RAG-ретривер (chunks -> LLM)
 try:
     from app.services.knowledge import retrieve as kb_retrieve
 except Exception:
     kb_retrieve = None
+
+# NEW: статическая KB-карточка (record -> HTML) из brands_kb.json
+try:
+    from app.services.knowledge import find_record as kb_find_record, build_caption_from_kb
+except Exception:
+    kb_find_record = None
+    def build_caption_from_kb(_): return ""
 
 router = Router()
 
@@ -308,7 +315,7 @@ async def ai_any_text(m: Message):
             log.info("[AI] local card in %.2fs", dt_ms / 1000.0)
             return
 
-        # 2) Иначе — пробуем KB-first (если есть ретривер), потом — Google CSE
+        # 2) Иначе — пробуем KB-first (если есть ретривер/статическая KB), потом — Google CSE
         status_msg = None
         with suppress(Exception):
             status_msg = await m.answer("Ищу в интернете и готовлю карточку…")
@@ -316,7 +323,67 @@ async def ai_any_text(m: Message):
         try:
             brand_guess = _guess_brand(q)
 
-            # --- KB-first (опционально) ---
+            # === NEW: прямой ответ из статической KB (brands_kb.json) ===
+            rec = None
+            if kb_find_record:
+                try:
+                    rec = kb_find_record(brand_guess or q)
+                except Exception as e:
+                    log.warning("[AI] kb_find_record error: %s", e)
+                    rec = None
+
+            if rec:
+                caption = _sanitize_caption(build_caption_from_kb(rec))
+
+                # картинка (если у тебя в ai_google ограничено на Википедию — применится)
+                img = None
+                try:
+                    img_query = rec.get("image_hint") or (brand_guess or q) + " бутылка бренд алкоголь label"
+                    img = await asyncio.wait_for(
+                        asyncio.to_thread(image_search_brand, img_query),
+                        timeout=8.0
+                    )
+                except asyncio.TimeoutError:
+                    img = None
+
+                # удалить «Ищу…»
+                with suppress(Exception):
+                    if status_msg:
+                        await status_msg.delete()
+
+                # отправка
+                try:
+                    if img and img.get("contentUrl"):
+                        await m.answer_photo(
+                            photo=img["contentUrl"],
+                            caption=caption,
+                            parse_mode="HTML",
+                            reply_markup=ai_exit_inline_kb(),
+                        )
+                    else:
+                        await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                except Exception:
+                    ai_inc("ai.error", tags={"stage": "tg_parse"})
+                    with suppress(Exception):
+                        if img and img.get("contentUrl"):
+                            await m.answer_photo(photo=img["contentUrl"], caption=caption, reply_markup=ai_exit_inline_kb())
+                        else:
+                            await m.answer(caption, reply_markup=ai_exit_inline_kb())
+
+                # метрики и выход
+                dt_ms = (time.monotonic() - t0) * 1000
+                ai_inc("ai.query",  tags={"intent": "brand"})
+                ai_inc("ai.source", tags={"source": "kb_static"})
+                ai_inc("ai.image",  tags={"present": "1" if (img and img.get("contentUrl")) else "0"})
+                ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_static"})
+                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_static"})
+                stop_typing.set()
+                with suppress(Exception):
+                    await typing_task
+                log.info("[AI] KB static card in %.2fs", dt_ms / 1000.0)
+                return
+
+            # --- KB-chunks (ретривер) -> LLM ---
             caption: str | None = None
             kb_chunks = None
             if kb_retrieve:
@@ -360,7 +427,7 @@ async def ai_any_text(m: Message):
                     raw = build_caption_from_results(q, results)
                 caption = _sanitize_caption(raw or f"<b>{q}</b>\n• Короткая сводка недоступна.")
 
-            # Картинка (если у тебя в ai_google ограничено на Wikipedia — это применится здесь автоматически)
+            # Картинка
             img = None
             try:
                 img = await asyncio.wait_for(
