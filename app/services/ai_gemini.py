@@ -29,28 +29,30 @@ _MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 def have_gemini() -> bool:
     return _HAS_LIB and bool(_GEMINI_KEY)
 
-# ---------- Вспомогалки ----------
+# ---------- СИСТЕМНЫЙ ПРОМПТ (строго про JSON по нужной схеме) ----------
 _SYSTEM_JSON = (
     "Ты — эксперт по алкогольным брендам и продажам HoReCa.\n"
-    "Отвечай ТОЛЬКО на основе переданных источников (RAG). Если факта нет — пиши null.\n"
-    "Не сравнивай с другими брендами.\n"
-    "Выводи СТРОГО JSON без лишнего текста и без Markdown/HTML.\n"
-    "Схема JSON:\n"
+    "Опирайся ТОЛЬКО на переданные источники (RAG). Если факта нет в источниках — ставь null.\n"
+    "Верни СТРОГО один JSON-объект без префиксов/суффиксов/Markdown/HTML.\n"
+    "Схема JSON строго такая:\n"
     "{\n"
-    '  "название": string,\n'
-    '  "категория": string | null,\n'
-    '  "страна": string | null,\n'
-    '  "крепость": string | null,\n'
-    '  "дегустационные_ноты": string | null,\n'
-    '  "производство": string | null,\n'
-    '  "как_продавать": string | null\n'
+    '  "name": string,                      \n'
+    '  "basics": {                          \n'
+    '    "category": string | null,         \n'
+    '    "country":  string | null,         \n'
+    '    "abv":      string | null          \n'
+    '  },                                    \n'
+    '  "taste":        string | null,       \n'
+    '  "serve":        string | null,       \n'
+    '  "pairing":      string | null,       \n'
+    '  "cocktails":    string[] | null,     \n'
+    '  "facts":        string[] | null,     \n'
+    '  "sales_script": string[] | null,     \n'
+    '  "sources":      string[] | null      \n'
     "}\n"
-    "Требования:\n"
-    "- Используй ТОЛЬКО факты из results.\n"
-    "- На русском, ≤ 900 символов.\n"
-    "- Если данных нет — ставь null, не выдумывай.\n"
+    "Требования: на русском; никаких оценочных эпитетов и сравнений; не выдумывай данные; "
+    "кратко, по делу. 'sources' — список URL из переданных источников, если они были.\n"
 )
-
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
@@ -64,6 +66,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
+        # иногда кавычки «ёлочки» / типографские
         raw = (raw
                .replace("\u201c", '"').replace("\u201d", '"')
                .replace("\u00ab", '"').replace("\u00bb", '"'))
@@ -107,12 +110,68 @@ def _pack_context(results_or_chunks: Any) -> tuple[str, List[str]]:
 
     return "нет данных", urls
 
+# ---------- НОРМАЛИЗАТОР (если модель вдруг вернула русские ключи) ----------
+def _normalize_schema(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        return {}
+    # уже правильная схема?
+    if "name" in d and "basics" in d:
+        return d
+
+    # возможные русские ключи → англ. схема
+    name = d.get("name") or d.get("название") or d.get("бренд") or ""
+    category = None
+    country  = None
+    abv      = None
+
+    # basics может быть как объект, так и россыпь полей
+    basics_ru = d.get("basics") or {}
+    if isinstance(basics_ru, dict):
+        category = basics_ru.get("category") or basics_ru.get("категория")
+        country  = basics_ru.get("country")  or basics_ru.get("страна")
+        abv      = basics_ru.get("abv")      or basics_ru.get("крепость")
+
+    category = category or d.get("категория")
+    country  = country  or d.get("страна")
+    abv      = abv      or d.get("крепость")
+
+    taste    = d.get("taste") or d.get("дегустационные_ноты") or d.get("ноты")
+    serve    = d.get("serve") or d.get("подача")
+    pairing  = d.get("pairing") or d.get("гастросочетания") or d.get("сочетания")
+
+    cocktails = d.get("cocktails") or d.get("коктейли")
+    if isinstance(cocktails, str):
+        cocktails = [cocktails]
+
+    facts = d.get("facts") or d.get("производство") or d.get("факты")
+    if isinstance(facts, str):
+        facts = [facts]
+
+    sales = d.get("sales_script") or d.get("как_продавать") or d.get("скрипт")
+    if isinstance(sales, str):
+        sales = [sales]
+
+    sources = d.get("sources") or d.get("источники")
+
+    return {
+        "name": name,
+        "basics": {"category": category, "country": country, "abv": abv},
+        "taste": taste,
+        "serve": serve,
+        "pairing": pairing,
+        "cocktails": cocktails if isinstance(cocktails, list) else None,
+        "facts": facts if isinstance(facts, list) else (None if facts is None else [str(facts)]),
+        "sales_script": sales if isinstance(sales, list) else (None if sales is None else [str(sales)]),
+        "sources": sources if isinstance(sources, list) else (None if sources is None else [str(sources)]),
+    }
+
+# ---------- РЕНДЕР КОМПАКТНОГО HTML ----------
 def _render_card_html(d: Dict[str, Any]) -> str:
-    # Только безопасные для Telegram теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>
     def esc(s: str) -> str:
         return (s or "").strip()
 
     name = esc(d.get("name", ""))
+
     b = d.get("basics", {}) or {}
     basics = []
     if b.get("category"): basics.append(f"Категория: {esc(b.get('category'))}")
@@ -136,14 +195,17 @@ def _render_card_html(d: Dict[str, Any]) -> str:
         lines.append("• Коктейли: " + ", ".join(esc(x) for x in ckt[:2]))
 
     facts = d.get("facts") or []
-    for f in facts[:3]:
-        lines.append("• " + esc(f))
+    if isinstance(facts, list):
+        for f in facts[:3]:
+            if f:
+                lines.append("• " + esc(f))
 
     ss = d.get("sales_script") or []
     if ss:
         lines.append("<b>Скрипт продажи:</b>")
         for s in ss[:3]:
-            lines.append("• " + esc(s))
+            if s:
+                lines.append("• " + esc(s))
 
     src = d.get("sources") or []
     if src:
@@ -151,38 +213,40 @@ def _render_card_html(d: Dict[str, Any]) -> str:
         lines.append("Источники: " + tail)
 
     card = "\n".join(lines).strip()
-    if len(card) > 1000:  # безопасный лимит для caption
+    if len(card) > 1000:  # лимит подписи для Telegram
         card = card[:1000].rstrip() + "…"
     return card
 
 # ---------- Основной генератор карточки (JSON -> HTML) ----------
 async def generate_caption_with_gemini(query: str, results_or_chunks: Optional[Any]) -> str:
     """
-    Новая версия: просим у модели СТРОГО JSON по схеме, парсим и рендерим в компактный HTML.
+    Просим у модели СТРОГО JSON по нужной схеме, парсим, нормализуем и рендерим HTML.
     На вход можно давать KB-чанки или CSE-результаты.
     """
     if not have_gemini():
         return "<b>LLM не настроен.</b>"
 
     context_block, ctx_urls = _pack_context(results_or_chunks)
-    system = _SYSTEM_JSON
     prompt = (
-        system
+        _SYSTEM_JSON
         + "\n\nПользовательский запрос:\n" + (query or "")
-        + "\n\nДОСТУПНЫЕ ИСТОЧНИКИ (используй только это):\n" + context_block
-        + "\n\nВЫВЕДИ ТОЛЬКО JSON СООТВЕТСТВУЮЩИЙ СХЕМЕ, БЕЗ ЛИШНЕГО ТЕКСТА."
+        + "\n\nДОСТУПНЫЕ ИСТОЧНИКИ (используй только это, придумывать запрещено):\n" + context_block
+        + "\n\nВЫВЕДИ ТОЛЬКО ОДИН JSON-ОБЪЕКТ СО СХЕМОЙ ВЫШЕ."
     )
 
     def _call_new():
         client = genai.Client(api_key=_GEMINI_KEY)
-        return client.models.generate_content(model=_MODEL, contents=prompt)
+        if _HAS_TYPES:
+            cfg = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
+            return client.models.generate_content(model=_MODEL, contents=prompt, config=cfg)
+        else:
+            return client.models.generate_content(model=_MODEL, contents=prompt)
 
     def _call_old():
         genai.configure(api_key=_GEMINI_KEY)
         mdl = genai.GenerativeModel(_MODEL)
         return mdl.generate_content(prompt)
 
-    # Вызов в отдельном потоке
     try:
         if hasattr(genai, "Client"):
             resp = await asyncio.to_thread(_call_new)
@@ -195,22 +259,26 @@ async def generate_caption_with_gemini(query: str, results_or_chunks: Optional[A
 
     data = _extract_json(raw)
     if not data:
-        # Фоллбек — минимальный JSON
+        # минимальный фолбэк (если вдруг ответ не JSON)
         data = {
             "name": query,
-            "basics": {"category": "", "country": "", "abv": "нет данных"},
-            "taste": "",
-            "serve": "",
-            "pairing": "",
-            "cocktails": [],
-            "facts": ["нет данных по источникам."],
+            "basics": {"category": None, "country": None, "abv": None},
+            "taste": None,
+            "serve": None,
+            "pairing": None,
+            "cocktails": None,
+            "facts": ["нет данных по предоставленным источникам."],
             "sales_script": [
-                "Уточните предпочтения гостя (сладость/крепость/ароматика).",
-                "Коротко обозначьте ценность: профиль вкуса, повод или сочетание."
+                "Уточните предпочтения гостя (сладость/ароматика/крепость).",
+                "Предложите короткую классику (Old Fashioned / Sour) или хайболл.",
             ],
-            "sources": ctx_urls[:3]
+            "sources": ctx_urls[:3] if ctx_urls else None,
         }
-    # Если модель не вернула sources, добавим из контекста
+
+    # Нормализуем схему (если пришли русские ключи и т.п.)
+    data = _normalize_schema(data)
+
+    # Если модель не вернула sources — добавим из контекста
     if not data.get("sources") and ctx_urls:
         data["sources"] = ctx_urls[:3]
 
@@ -227,19 +295,17 @@ async def generate_sales_playbook_with_gemini(query: str, outlet: str | None, br
         return "LLM не настроен."
 
     system = (
-        "Ты — тренер по продажам алкоголя для HoReCa и розницы в Казахстане.\n"
+        "Ты — тренер по продажам алкоголя для HoReCa и розницы.\n"
         "Отвечай кратко и структурно в HTML для Telegram. Разрешены теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>.\n"
-        "Запрещены сравнения с другими брендами, упоминания конкурентов и любые цены.\n"
-        "Не утверждай технические факты (крепость/выдержка и т.п.), если они не были явно предоставлены ранее.\n"
-        "Дай чек-лист для продавца.\n"
+        "Запрещены сравнения с другими брендами и цены. Не выдумывай факты.\n"
         "Структура:\n"
         "<b>Цель</b>: что продаём и где (1 строка)\n"
         "<b>Кому</b>: портрет покупателя/гостя (2–3 пункта)\n"
-        "<b>Аргументы</b>: 4–6 коротких буллитов (вкус/сценарий/повод/сезон/миксология — без брендов)\n"
-        "<b>Как предложить</b>: 2–3 реплики продавца (мини-скрипт)\n"
+        "<b>Аргументы</b>: 4–6 коротких буллитов\n"
+        "<b>Как предложить</b>: 2–3 реплики продавца\n"
         "<b>Возражения и ответы</b>: 3–4 пары\n"
-        "<b>Доп. продажи</b>: 2–3 идеи (закуска, посуда, миксеры — без брендов)\n"
-        "<b>Юридически</b>: напоминание про 18+ и ответственное потребление\n"
+        "<b>Доп. продажи</b>: 2–3 идеи\n"
+        "<b>Юридически</b>: 18+ и ответственное потребление\n"
     )
     topic = f"Запрос: {query}\nМесто: {outlet or 'не указано'}\nБренд: {brand or 'не указан'}"
     prompt = system + "\n\n" + topic + "\nОтвет дай строго в HTML без лишних вступлений."
