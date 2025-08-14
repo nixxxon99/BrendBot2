@@ -87,7 +87,7 @@ if enriched and (enriched.get("basics") or enriched.get("taste")):
     if meta: lines.append("• " + meta)
     if enriched.get("taste"): lines.append("• Профиль: " + enriched["taste"])
     for fct in (enriched.get("facts") or [])[:3]:
-        if not fct.lower().startswith("категория") and not fct.lower().startswith("страна") and not fct.lower().startswith("крепость"):
+        if not fct.lower().startswith(("категория", "страна", "крепость")):
             lines.append("• " + fct)
     srcs = enriched.get("sources") or []
     if srcs:
@@ -103,6 +103,7 @@ if not caption and generate_caption_with_gemini:
     except Exception:
         caption = ""
 
+# финальный фолбэк по сниппетам
 if not caption:
     items = (results or {}).get("results", [])
     lines = []
@@ -119,9 +120,11 @@ caption = _sanitize_caption(caption)
 # Картинка — если экстрактор не нашёл, доберём через image_search
 if not photo_url:
     with suppress(Exception):
-        img = image_search_brand((brand_guess or q) + " bottle label")
+        img = image_search_brand((brand_guess or q) + " бутылка этикетка")
         if isinstance(img, dict):
             photo_url = img.get("contentUrl") or img.get("contextLink")
+
+# === НОВОЕ: автосохранение URL в JSON (если нет фото)
 if photo_url:
     try:
         from app.services.brands import set_image_url_for_brand
@@ -129,6 +132,7 @@ if photo_url:
     except Exception:
         pass
 
+# Отправка ответа (один раз!)
 try:
     if photo_url:
         await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
@@ -136,7 +140,6 @@ try:
         await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 except TelegramBadRequest:
     await m.answer(caption, reply_markup=menu_ai_exit_kb())
-
 
 # =========================
 # Состояние AI-режима / антиспам
