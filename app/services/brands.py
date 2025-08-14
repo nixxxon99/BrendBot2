@@ -239,3 +239,75 @@ def fuzzy_suggest(text: str, limit: int = 10) -> List[Tuple[str, float]]:
 точный_поиск = exact_lookup
 нечеткий_подсказка = fuzzy_suggest
 получить_бренд = get_brand
+# --- Автосохранение URL картинки в локальную базу ---
+def set_image_url_for_brand(name: str, url: str) -> bool:
+    """
+    Если у бренда нет photo_file_id — сохраняем image_url в data/catalog.json.
+    Обновляем память и индексы, чтобы сработало без перезапуска.
+    Возвращает True, если записали на диск.
+    """
+    try:
+        from pathlib import Path
+        import json
+
+        name_clean = (name or "").strip()
+        if not name_clean or not url:
+            return False
+
+        path = Path("data/catalog.json")
+        # читаем существующее содержимое (список объектов)
+        data = []
+        if path.exists():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                loaded = json.loads(raw)
+                data = loaded if isinstance(loaded, list) else []
+            except Exception:
+                data = []
+
+        # ищем запись по точному совпадению brand
+        idx = -1
+        for i, it in enumerate(data):
+            if (it.get("brand") or "").strip().lower() == name_clean.lower():
+                idx = i
+                break
+
+        if idx >= 0:
+            item = dict(data[idx])
+            # если уже есть file_id — ничего не трогаем
+            if item.get("photo_file_id"):
+                pass
+            else:
+                # не затираем существующий image_url, если он уже есть
+                item.setdefault("image_url", url)
+                data[idx] = item
+        else:
+            # новой записи достаточно brand + image_url
+            data.append({"brand": name_clean, "image_url": url})
+
+        # пишем на диск (красиво, UTF-8)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # --- Обновляем память и индексы, чтобы сразу заработало ---
+        try:
+            # RAW и индексируются в этом модуле
+            global RAW
+            updated = False
+            for it in RAW:
+                if (it.get("brand") or "").strip().lower() == name_clean.lower():
+                    if not it.get("photo_file_id"):
+                        it.setdefault("image_url", url)
+                    updated = True
+                    break
+            if not updated:
+                RAW.append({"brand": name_clean, "image_url": url})
+
+            # пересобираем индексы
+            _build_indexes()
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        print("[brands] set_image_url_for_brand error:", e)
+        return False
