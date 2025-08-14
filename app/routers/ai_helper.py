@@ -19,6 +19,9 @@ from app.keyboards.menus import (
     ai_exit_inline_kb,
 )
 
+# NEW: метрики
+from app.stats import ai_inc, ai_observe_ms
+
 log = logging.getLogger(__name__)
 
 # === Санитайзер HTML под Telegram ===
@@ -179,6 +182,8 @@ def _guess_brand(q: str) -> str | None:
 @router.message(F.text == AI_ENTRY_BUTTON_TEXT)
 async def enter_ai_by_button(m: Message):
     AI_USERS.add(m.from_user.id)
+    # метрика входа
+    ai_inc("ai.enter", tags={"how": "button"})
     await m.answer(
         "AI-режим включён. Напишите название бренда или вопрос.",
         reply_markup=None,
@@ -187,6 +192,8 @@ async def enter_ai_by_button(m: Message):
 @router.message(Command("ai"))
 async def enter_ai_cmd(m: Message):
     AI_USERS.add(m.from_user.id)
+    # метрика входа
+    ai_inc("ai.enter", tags={"how": "command"})
     await m.answer(
         "AI-режим включён. Напишите название бренда или вопрос.",
         reply_markup=None,
@@ -195,6 +202,8 @@ async def enter_ai_cmd(m: Message):
 @router.callback_query(F.data == "ai:exit")
 async def exit_ai_cb(c: CallbackQuery):
     AI_USERS.discard(c.from_user.id)
+    # метрика выхода
+    ai_inc("ai.exit", tags={"how": "inline"})
     await c.message.answer(
         "AI-режим выключен. Вы в главном меню.",
         reply_markup=main_menu_kb(),
@@ -205,6 +214,8 @@ async def exit_ai_cb(c: CallbackQuery):
 @router.message(Command("ai_off"))
 async def exit_ai_cmd(m: Message):
     AI_USERS.discard(m.from_user.id)
+    # метрика выхода
+    ai_inc("ai.exit", tags={"how": "command"})
     await m.answer(
         "AI-режим выключен. Вы в главном меню.",
         reply_markup=main_menu_kb(),
@@ -220,6 +231,7 @@ async def ai_any_text(m: Message):
     # антиспам: кулдаун
     left = _too_soon(m.from_user.id)
     if left > 0:
+        ai_inc("ai.cooldown", tags={"left": int(round(left))})
         with suppress(Exception):
             await m.answer(f"Чуть-чуть погодите {left:.0f} сек…")
         return
@@ -236,6 +248,7 @@ async def ai_any_text(m: Message):
         # 0) Продажный интент: “как продать …”
         sale = detect_sales_intent(q)
         if sale and have_gemini():
+            ai_inc("ai.query", tags={"intent": "sales"})
             try:
                 html = await asyncio.wait_for(
                     generate_sales_playbook_with_gemini(q, sale.get("outlet"), _guess_brand(q)),
@@ -244,30 +257,52 @@ async def ai_any_text(m: Message):
             except asyncio.TimeoutError:
                 html = "<b>Долго думаем…</b>\n• Попробуйте уточнить запрос или повторить позже."
             text = _sanitize_caption(html)
-            with suppress(Exception):
+            try:
                 await m.answer(text, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+            except Exception:
+                ai_inc("ai.error", tags={"stage": "tg_parse"})
+                with suppress(Exception):
+                    await m.answer(text, reply_markup=ai_exit_inline_kb())
+
             stop_typing.set()
             with suppress(Exception):
                 await typing_task
-            log.info("[AI] sales playbook in %.2fs", time.monotonic() - t0)
+            dt_ms = (time.monotonic() - t0) * 1000
+            ai_inc("ai.answer", tags={"intent": "sales"})
+            ai_observe_ms("ai.latency", dt_ms, tags={"intent": "sales"})
+            log.info("[AI] sales playbook in %.2fs", dt_ms / 1000.0)
             return
 
         # 1) локальная карточка из твоей базы (если точный матч)
         name = exact_lookup(q)
         if name:
+            ai_inc("ai.query", tags={"intent": "brand"})
             item = get_brand(name)
             caption = _sanitize_caption(item["caption"])
-            with suppress(Exception):
+            try:
                 await m.answer_photo(
                     photo=item["photo_file_id"],
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=ai_exit_inline_kb(),
                 )
+            except Exception:
+                ai_inc("ai.error", tags={"stage": "tg_parse"})
+                with suppress(Exception):
+                    await m.answer_photo(
+                        photo=item["photo_file_id"],
+                        caption=caption,
+                        reply_markup=ai_exit_inline_kb(),
+                    )
+
             stop_typing.set()
             with suppress(Exception):
                 await typing_task
-            log.info("[AI] local card in %.2fs", time.monotonic() - t0)
+            dt_ms = (time.monotonic() - t0) * 1000
+            ai_inc("ai.source", tags={"source": "local"})
+            ai_inc("ai.answer", tags={"intent": "brand", "source": "local"})
+            ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "local"})
+            log.info("[AI] local card in %.2fs", dt_ms / 1000.0)
             return
 
         # 2) Иначе — пробуем KB-first (если есть ретривер), потом — Google CSE
@@ -337,7 +372,7 @@ async def ai_any_text(m: Message):
                 if status_msg:
                     await status_msg.delete()
 
-            with suppress(Exception):
+            try:
                 if img and img.get("contentUrl"):
                     await m.answer_photo(
                         photo=img["contentUrl"],
@@ -347,9 +382,33 @@ async def ai_any_text(m: Message):
                     )
                 else:
                     await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+            except Exception:
+                ai_inc("ai.error", tags={"stage": "tg_parse"})
+                # fallback без parse_mode на случай «unsupported start tag»
+                if img and img.get("contentUrl"):
+                    with suppress(Exception):
+                        await m.answer_photo(
+                            photo=img["contentUrl"],
+                            caption=caption,
+                            reply_markup=ai_exit_inline_kb(),
+                        )
+                else:
+                    with suppress(Exception):
+                        await m.answer(caption, reply_markup=ai_exit_inline_kb())
+
+            # метрики по источнику/картинке/латенции
+            source_used = "kb" if (kb_retrieve and kb_chunks) else "web"
+            ai_inc("ai.query",  tags={"intent": "brand"})
+            ai_inc("ai.source", tags={"source": source_used})
+            ai_inc("ai.image",  tags={"present": "1" if (img and img.get("contentUrl")) else "0"})
+            ai_inc("ai.answer", tags={"intent": "brand", "source": source_used})
+            dt_ms = (time.monotonic() - t0) * 1000
+            ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": source_used})
+            log.info("[AI] finished in %.2fs (%s)", dt_ms / 1000.0, source_used)
 
         except FetchError as e:
             log.warning("[AI] fetch error: %s", e)
+            ai_inc("ai.error", tags={"stage": "fetch"})
             with suppress(Exception):
                 if status_msg:
                     await status_msg.delete()
@@ -362,6 +421,9 @@ async def ai_any_text(m: Message):
                 caption = _sanitize_caption(raw or f"<b>{q}</b>\n• Не удалось получить данные из интернета.")
                 with suppress(Exception):
                     await m.answer(caption, parse_mode="HTML", reply_markup=ai_exit_inline_kb())
+                dt_ms = (time.monotonic() - t0) * 1000
+                ai_inc("ai.answer", tags={"intent": "brand", "source": "llm_only"})
+                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "llm_only"})
             else:
                 with suppress(Exception):
                     await m.answer(
@@ -372,4 +434,3 @@ async def ai_any_text(m: Message):
             stop_typing.set()
             with suppress(Exception):
                 await typing_task
-            log.info("[AI] finished in %.2fs", time.monotonic() - t0)
