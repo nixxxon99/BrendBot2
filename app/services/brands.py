@@ -1,64 +1,136 @@
-
-import json
-import unicodedata
+# app/services/brands.py
+# Поддержка JSON в виде СПИСКА [{...}, {...}] и/или словаря {name: {...}}
+from __future__ import annotations
+import json, re
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+from difflib import SequenceMatcher
 
-from rapidfuzz import process, fuzz
+SOURCE_FILES = [Path("data/catalog.json"), Path("data/brands_kb.json")]
 
-CATALOG_PATH = Path(__file__).resolve().parents[2] / "data" / "catalog.json"
+def _load_raw() -> List[Dict[str, Any]]:
+    for p in SOURCE_FILES:
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                items: List[Dict[str, Any]] = []
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        d = dict(v); d.setdefault("brand", k); items.append(d)
+                print(f"[brands] Loaded {len(items)} items from {p} (dict)")
+                return items
+            elif isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict)]
+                print(f"[brands] Loaded {len(items)} items from {p} (list)")
+                return items
+            else:
+                print(f"[brands] Unsupported JSON root in {p}: {type(data)}")
+                return []
+    print("[brands] No data file found")
+    return []
 
-def normalize(text: str) -> str:
-    # lower, strip, remove punctuation/spaces, basic transliteration-like normalize
-    text = unicodedata.normalize("NFKD", text).lower()
-    return "".join(ch for ch in text if ch.isalnum())
+RAW: List[Dict[str, Any]] = _load_raw()
 
-def load_catalog() -> Dict[str, Any]:
-    with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _norm(s: str) -> str:
+    s = (s or "").lower().strip().replace("’", "'")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\b(\d+[.,]?\d*)\s*(l|л|литр(а|ов)?|ml|мл)\b", " ", s)  # литражи
+    s = re.sub(r"\b(0\.\d+|[1-9]\d*)\b", " ", s)                         # «голые» числа
+    return re.sub(r"\s+", " ", s).strip()
 
-CATALOG = load_catalog()
+NAME_INDEX: Dict[str, Dict[str, Any]] = {}
+ALIASES: Dict[str, str] = {}
+ALL_CANON: List[str] = []
 
-# Build alias map
-ALIAS_MAP: Dict[str, str] = {}
-for name, item in CATALOG.items():
-    ALIAS_MAP[normalize(name)] = name
-    for a in item.get("aliases", []):
-        ALIAS_MAP[normalize(a)] = name
+def _build_indexes() -> None:
+    NAME_INDEX.clear(); ALIASES.clear(); ALL_CANON.clear()
+    for entry in RAW:
+        brand = (entry.get("brand") or "").strip()
+        if not brand: continue
+        key = _norm(brand)
+        NAME_INDEX[key] = entry
+        ALL_CANON.append(brand)
+        for alias in entry.get("aliases", []) or []:
+            akey = _norm(alias)
+            if akey and akey not in NAME_INDEX:
+                ALIASES[akey] = brand
 
-def categories() -> List[str]:
-    cats = set()
-    for item in CATALOG.values():
-        cats.add(item["category"])
-    return sorted(cats)
+_build_indexes()
 
-def by_category(cat: str) -> List[str]:
-    return [name for name, item in CATALOG.items() if item["category"] == cat]
+def _build_caption(entry: Dict[str, Any]) -> str:
+    brand   = entry.get("brand", "")
+    cat     = entry.get("category", "")
+    country = entry.get("country", "")
+    abv     = entry.get("abv", "")
+    notes   = entry.get("tasting_notes", "")
+    facts   = entry.get("production_facts", "")
+    sell    = entry.get("sales_script", "")
 
-def exact_lookup(query: str) -> str | None:
-    key = normalize(query)
-    return ALIAS_MAP.get(key)
+    head = f"<b>{brand}</b>"
+    meta = " · ".join([x for x in [cat, country, abv] if x])
+    if meta: head += f"\n<i>{meta}</i>"
 
-def fuzzy_suggest(query: str, limit: int = 6) -> List[Tuple[str, int]]:
-    universe = list(CATALOG.keys())
-    # combine names + aliases for stronger recall
-    searchable = []
-    for name, item in CATALOG.items():
-        searchable.append(name)
-        searchable.extend(item.get("aliases", []))
-    # RapidFuzz returns (match, score, idx) — we keep unique brand names
-    results = process.extract(query, searchable, scorer=fuzz.WRatio, limit=20)
-    seen = set()
-    out: List[Tuple[str, int]] = []
-    for cand, score, _ in results:
-        brand_name = next((name for name, item in CATALOG.items()
-                           if cand == name or cand in item.get("aliases", [])), None)
-        if brand_name and brand_name not in seen:
-            seen.add(brand_name)
-            out.append((brand_name, int(score)))
-        if len(out) >= limit:
-            break
-    return out
+    parts = [head]
+    if notes: parts.append(notes)
+    if facts: parts.append(facts)
+    if sell:  parts.append(f"<b>Как продавать:</b> {sell}")
 
-def get_brand(name: str) -> Dict[str, Any] | None:
-    return CATALOG.get(name)
+    caption = "\n".join(parts)
+    caption = re.sub(r"\n{3,}", "\n\n", caption).strip()
+    if len(caption) > 1000: caption = caption[:997] + "…"
+    return caption
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+# -------- Публичный интерфейс (как у тебя в коде) --------
+def exact_lookup(text: str) -> Optional[str]:
+    key = _norm(text)
+    if key in NAME_INDEX: return NAME_INDEX[key].get("brand")
+    if key in ALIASES:    return ALIASES[key]
+    return None
+
+def get_brand(name: str) -> Optional[Dict[str, Any]]:
+    canon = exact_lookup(name) or name
+    entry = NAME_INDEX.get(_norm(canon))
+    if not entry: return None
+    return {
+        "name": entry.get("brand", canon),
+        "caption": _build_caption(entry),
+        "photo_file_id": entry.get("photo_file_id"),  # может быть None
+        "category": entry.get("category", "")
+    }
+
+def by_category(cat_query: str, limit: int = 50) -> List[str]:
+    q = _norm(cat_query); out: List[str] = []
+    for entry in NAME_INDEX.values():
+        cat = _norm(entry.get("category", ""))
+        if q and q in cat:
+            b = entry.get("brand"); 
+            if b: 
+                out.append(b)
+                if len(out) >= limit: break
+    return sorted(set(out))
+
+def fuzzy_suggest(text: str, limit: int = 10) -> List[Tuple[str, float]]:
+    t = (text or "").strip()
+    if not t: return []
+    t_norm = _norm(t)
+    candidates = set(ALL_CANON); candidates.update(ALIASES.values())
+
+    hits = [(c, 1.0) for c in candidates if t_norm and t_norm in _norm(c)]
+    scored: List[Tuple[str, float]] = []
+    for c in candidates:
+        s = _similar(t.lower(), c.lower())
+        if s >= 0.6: scored.append((c, s))
+
+    by_name: Dict[str, float] = {n: s for n, s in scored}
+    for n, s in hits: by_name[n] = max(by_name.get(n, 0.0), s)
+    return sorted(by_name.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+# -------- Русские синонимы (если где-то так импортируешь) --------
+по_категории = by_category
+точный_поиск = exact_lookup
+нечеткий_подсказка = fuzzy_suggest
+получить_бренд = get_brand
