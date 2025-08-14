@@ -1,111 +1,228 @@
 # app/services/ai_gemini.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
-import os
-import logging
+import os, logging, re, json, asyncio
 
 log = logging.getLogger(__name__)
 
-# библиотека Gemini
+# === Библиотека Gemini (поддержка old/new SDK) ===
 try:
-    import google.generativeai as genai
-    from google.genai import types
+    import google.generativeai as genai  # old SDK
+    try:
+        from google.genai import types   # new SDK (google-genai)
+        _HAS_TYPES = True
+    except Exception:
+        types = None
+        _HAS_TYPES = False
     _HAS_LIB = True
 except Exception as e:
     log.warning("Gemini lib not installed: %s", e)
+    genai = None
+    types = None
+    _HAS_TYPES = False
     _HAS_LIB = False
 
-# ключ можно назвать GEMINI_API_KEY или GOOGLE_API_KEY
+# Ключ и модель
 _GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-_MODEL = "gemini-1.5-flash"
-
-_SYSTEM = (
-    "Ты — эксперт по алкогольным брендам и продажам HoReCa.\n"
-    "Собери КОРОТКУЮ, полезную карточку бренда в HTML для Telegram.\n\n"
-    "Жёсткие правила:\n"
-    "• Используй ТОЛЬКО факты из блока «Результаты поиска» ниже (никаких домыслов).\n"
-    "• Если факта нет в источниках — честно напиши «нет данных» и иди дальше.\n"
-    "• Разрешённые теги: <b>, <i>, <u>, <s>, <a href='...'>, <code>, <pre>, <br>.\n"
-    "• НЕ используй <h1..h6>, <ul>, <ol>, <li>, <p>, <div> и пр. (Телеграм их не принимает).\n"
-    "• Карточку делай компактной (≈1500–1800 символов), пунктов не больше 5–6.\n"
-    "• В разделе «Скрипт продажи» СТРОГО ЗАПРЕЩЕНО сравнение с другими брендами и упоминание конкурентов. "
-    "Не пиши слова «аналог», «альтернатива», «вместо», «как [бренд]», «конкурент» и т.п.; "
-    "фокусируйся только на ценности самого продукта, сценариях употребления и выгодах для гостя.\n\n"
-    "Структура карточки (строго в этом порядке):\n"
-    "<b>Название (оригинал)</b>\n"
-    "• Категория / страна / крепость: {данные или «нет данных»}\n"
-    "• Профиль вкуса/ароматики: {кратко, по источникам}\n"
-    "• Подача: {бокал, температура/со льдом, гарнир — только если в источниках}\n"
-    "• С чем сочетается: {если есть данные в источниках}\n"
-    "• Коктейли: {если в источниках упомянуты 1–2 классики}\n"
-    "• 2–3 ключевых факта о производстве/выдержке/истории (по источникам)\n"
-    "• Скрипт продажи: 2–3 нейтральные фразы без упоминания других брендов "
-    "(какая ценность для гостя, для какого настроения/повода, как предложить в баре).\n\n"
-    "В конце добавь строку с источниками (до 3 ссылок):\n"
-    "Источники: <a href='URL1'>[1]</a> <a href='URL2'>[2]</a> <a href='URL3'>[3]</a>\n"
-)
+_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 def have_gemini() -> bool:
     return _HAS_LIB and bool(_GEMINI_KEY)
 
-def _client():
-    if not have_gemini():
-        raise RuntimeError("Gemini is not configured")
-    genai.configure(api_key=_GEMINI_KEY)
-    return genai.GenerativeModel(_MODEL)
+# ---------- Вспомогалки ----------
+_SYSTEM_JSON = (
+    "Ты — эксперт по алкогольным брендам и продажам HoReCa.\n"
+    "Отвечай ТОЛЬКО на основе переданных источников (RAG). Если факта нет — пиши «нет данных».\n"
+    "Не сравнивай с другими брендами. Пиши кратко и по делу.\n"
+    "Выводи СТРОГО JSON без лишнего текста и без Markdown/HTML.\n"
+    "Схема JSON:\n"
+    "{\n"
+    '  \"name\": \"строка — официальное/распознанное название\",\n'
+    '  \"basics\": {\"category\": \"строка\", \"country\": \"строка\", \"abv\": \"строка или «нет данных»\"},\n'
+    '  \"taste\": \"кратко про аромат/вкус (если есть)\",\n'
+    '  \"serve\": \"подача (бокал/температура/гарнир), только если есть в источниках\",\n'
+    '  \"pairing\": \"с чем сочетается (если есть)\",\n'
+    '  \"cocktails\": [\"до 2 классик по источникам\"],\n'
+    '  \"facts\": [\"1–3 факта о производстве/выдержке/истории по источникам\"],\n'
+    '  \"sales_script\": [\"2–3 нейтральные фразы для продажи без сравнений\"],\n'
+    '  \"sources\": [\"до 3 url из переданных источников\"]\n'
+    "}\n"
+)
 
-def _build_prompt_from_results(query: str, results: Dict[str, Any]) -> str:
-    bullets: List[str] = []
-    for r in results.get("results", [])[:8]:
-        name = (r.get("name") or "").strip()
-        snip = (r.get("snippet") or "").strip()
-        url = (r.get("url") or "").strip()
-        if snip:
-            bullets.append(f"- {snip} (источник: {url})")
-        elif name:
-            bullets.append(f"- {name} (источник: {url})")
-    joined = "\n".join(bullets) if bullets else "нет данных"
-    return (
-        f"{_SYSTEM}\n\n"
-        f"Запрос пользователя: {query}\n\n"
-        f"Результаты поиска:\n{joined}\n"
-    )
+_JSON_RE = re.compile(r"\{.*\}", re.S)
 
-def _build_prompt_no_results(query: str) -> str:
-    return (
-        f"{_SYSTEM}\n\n"
-        f"Запрос пользователя: {query}\n\n"
-        "Результаты поиска: нет данных\n"
-    )
-
-async def generate_caption_with_gemini(query: str, results: Optional[Dict[str, Any]]) -> str:
-    import asyncio
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_generate, query, results)
-
-def _sync_generate(query: str, results: Optional[Dict[str, Any]]) -> str:
-    mdl = _client()
-    prompt = _build_prompt_from_results(query, results) if results else _build_prompt_no_results(query)
+def _extract_json(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    m = _JSON_RE.search(text)
+    if not m:
+        return {}
+    raw = m.group(0)
     try:
-        resp = mdl.generate_content(prompt)
-        text = (resp.text or "").strip()
-        if not text:
-            return f"<b>{query}</b>\n• Краткая информация недоступна."
-        return text
+        return json.loads(raw)
+    except Exception:
+        raw = (raw
+               .replace("\u201c", '"').replace("\u201d", '"')
+               .replace("\u00ab", '"').replace("\u00bb", '"'))
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+def _pack_context(results_or_chunks: Any) -> tuple[str, List[str]]:
+    """
+    Возвращает (текстовый блок контекста, список источников-url)
+    Поддерживает:
+      - KB-чанки: [{'text':..., 'url':..., 'brand':...}, ...]
+      - CSE-результаты: {'results': [{'name','snippet','url'}, ...]}
+    """
+    urls: List[str] = []
+    if isinstance(results_or_chunks, list) and results_or_chunks and isinstance(results_or_chunks[0], dict):
+        # KB чанки
+        lines = []
+        for i, ch in enumerate(results_or_chunks[:10], 1):
+            text = (ch.get("text") or "").strip()
+            url = (ch.get("url") or "").strip()
+            if url:
+                urls.append(url)
+                lines.append(f"[{i}] {url}\n{text}")
+            else:
+                lines.append(f"[{i}]\n{text}")
+        return ("\n\n".join(lines) if lines else "нет данных"), urls
+
+    if isinstance(results_or_chunks, dict) and "results" in results_or_chunks:
+        lines = []
+        for i, r in enumerate(results_or_chunks.get("results", [])[:10], 1):
+            name = (r.get("name") or "").strip()
+            snip = (r.get("snippet") or "").strip()
+            url = (r.get("url") or "").strip()
+            if url:
+                urls.append(url)
+            payload = snip or name or ""
+            lines.append(f"[{i}] {url}\n{payload}")
+        return ("\n\n".join(lines) if lines else "нет данных"), urls
+
+    return "нет данных", urls
+
+def _render_card_html(d: Dict[str, Any]) -> str:
+    # Только безопасные для Telegram теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>
+    def esc(s: str) -> str:
+        return (s or "").strip()
+
+    name = esc(d.get("name", ""))
+    b = d.get("basics", {}) or {}
+    basics = []
+    if b.get("category"): basics.append(f"Категория: {esc(b.get('category'))}")
+    if b.get("country"):  basics.append(f"Страна: {esc(b.get('country'))}")
+    if b.get("abv"):      basics.append(f"Крепость: {esc(b.get('abv'))}")
+
+    lines: List[str] = []
+    if name:
+        lines.append(f"<b>{name}</b>")
+    if basics:
+        lines.append("• " + " | ".join(basics))
+    if d.get("taste"):
+        lines.append("• Профиль: " + esc(d.get("taste")))
+    if d.get("serve"):
+        lines.append("• Подача: " + esc(d.get("serve")))
+    if d.get("pairing"):
+        lines.append("• Сочетания: " + esc(d.get("pairing")))
+
+    ckt = d.get("cocktails") or []
+    if isinstance(ckt, list) and ckt:
+        lines.append("• Коктейли: " + ", ".join(esc(x) for x in ckt[:2]))
+
+    facts = d.get("facts") or []
+    for f in facts[:3]:
+        lines.append("• " + esc(f))
+
+    ss = d.get("sales_script") or []
+    if ss:
+        lines.append("<b>Скрипт продажи:</b>")
+        for s in ss[:3]:
+            lines.append("• " + esc(s))
+
+    src = d.get("sources") or []
+    if src:
+        tail = " ".join([f"<a href='{esc(u)}'>[{i+1}]</a>" for i, u in enumerate(src[:3])])
+        lines.append("Источники: " + tail)
+
+    card = "\n".join(lines).strip()
+    if len(card) > 1000:  # безопасный лимит для caption
+        card = card[:1000].rstrip() + "…"
+    return card
+
+# ---------- Основной генератор карточки (JSON -> HTML) ----------
+async def generate_caption_with_gemini(query: str, results_or_chunks: Optional[Any]) -> str:
+    """
+    Новая версия: просим у модели СТРОГО JSON по схеме, парсим и рендерим в компактный HTML.
+    На вход можно давать KB-чанки или CSE-результаты.
+    """
+    if not have_gemini():
+        return "<b>LLM не настроен.</b>"
+
+    context_block, ctx_urls = _pack_context(results_or_chunks)
+    system = _SYSTEM_JSON
+    prompt = (
+        system
+        + "\n\nПользовательский запрос:\n" + (query or "")
+        + "\n\nДОСТУПНЫЕ ИСТОЧНИКИ (используй только это):\n" + context_block
+        + "\n\nВЫВЕДИ ТОЛЬКО JSON СООТВЕТСТВУЮЩИЙ СХЕМЕ, БЕЗ ЛИШНЕГО ТЕКСТА."
+    )
+
+    def _call_new():
+        client = genai.Client(api_key=_GEMINI_KEY)
+        return client.models.generate_content(model=_MODEL, contents=prompt)
+
+    def _call_old():
+        genai.configure(api_key=_GEMINI_KEY)
+        mdl = genai.GenerativeModel(_MODEL)
+        return mdl.generate_content(prompt)
+
+    # Вызов в отдельном потоке
+    try:
+        if hasattr(genai, "Client"):
+            resp = await asyncio.to_thread(_call_new)
+        else:
+            resp = await asyncio.to_thread(_call_old)
+        raw = (getattr(resp, "text", "") or "").strip()
     except Exception as e:
         log.warning("Gemini generation error: %s", e)
-        return f"<b>{query}</b>\n• Краткая информация недоступна."
+        raw = ""
 
+    data = _extract_json(raw)
+    if not data:
+        # Фоллбек — минимальный JSON
+        data = {
+            "name": query,
+            "basics": {"category": "", "country": "", "abv": "нет данных"},
+            "taste": "",
+            "serve": "",
+            "pairing": "",
+            "cocktails": [],
+            "facts": ["нет данных по источникам."],
+            "sales_script": [
+                "Уточните предпочтения гостя (сладость/крепость/ароматика).",
+                "Коротко обозначьте ценность: профиль вкуса, повод или сочетание."
+            ],
+            "sources": ctx_urls[:3]
+        }
+    # Если модель не вернула sources, добавим из контекста
+    if not data.get("sources") and ctx_urls:
+        data["sources"] = ctx_urls[:3]
 
+    html = _render_card_html(data)
+    return html
+
+# ---------- Тренерский «playbook» (оставлен) ----------
 async def generate_sales_playbook_with_gemini(query: str, outlet: str | None, brand: str | None) -> str:
     """
     Короткий тренерский разбор: как продавать указанный продукт в заданном формате точки.
     Без сравнений/конкурентов/цен. HTML совместим с Telegram.
     """
-    import asyncio
-
     if not have_gemini():
         return "LLM не настроен."
+
     system = (
         "Ты — тренер по продажам алкоголя для HoReCa и розницы в Казахстане.\n"
         "Отвечай кратко и структурно в HTML для Telegram. Разрешены теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>.\n"
@@ -124,17 +241,25 @@ async def generate_sales_playbook_with_gemini(query: str, outlet: str | None, br
     topic = f"Запрос: {query}\nМесто: {outlet or 'не указано'}\nБренд: {brand or 'не указан'}"
     prompt = system + "\n\n" + topic + "\nОтвет дай строго в HTML без лишних вступлений."
 
-    cfg = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_budget=0)
-    )
-
-    def _call():
+    def _call_new():
         client = genai.Client(api_key=_GEMINI_KEY)
-        return client.models.generate_content(
-            model=_MODEL,
-            contents=prompt,
-            config=cfg,
-        )
+        if _HAS_TYPES:
+            cfg = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
+            return client.models.generate_content(model=_MODEL, contents=prompt, config=cfg)
+        else:
+            return client.models.generate_content(model=_MODEL, contents=prompt)
 
-    resp = await asyncio.to_thread(_call)
-    return (getattr(resp, "text", "") or "Не удалось сгенерировать ответ.").strip()
+    def _call_old():
+        genai.configure(api_key=_GEMINI_KEY)
+        mdl = genai.GenerativeModel(_MODEL)
+        return mdl.generate_content(prompt)
+
+    try:
+        if hasattr(genai, "Client"):
+            resp = await asyncio.to_thread(_call_new)
+        else:
+            resp = await asyncio.to_thread(_call_old)
+        return (getattr(resp, "text", "") or "Не удалось сгенерировать ответ.").strip()
+    except Exception as e:
+        log.warning("Gemini playbook error: %s", e)
+        return "Не удалось сгенерировать ответ."
