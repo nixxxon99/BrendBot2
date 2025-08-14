@@ -29,31 +29,46 @@ _MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 def have_gemini() -> bool:
     return _HAS_LIB and bool(_GEMINI_KEY)
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ (строго про JSON по нужной схеме) ----------
+# ---------- СИСТЕМНЫЕ ПРОМПТЫ ----------
+# 1) Для карточек брендов (СТРОГО JSON по схеме → потом рендерим в HTML)
 _SYSTEM_JSON = (
-    "Ты — эксперт по алкогольным брендам и продажам HoReCa.\n"
-    "Опирайся ТОЛЬКО на переданные источники (RAG). Если факта нет в источниках — ставь null.\n"
-    "Верни СТРОГО один JSON-объект без префиксов/суффиксов/Markdown/HTML.\n"
-    "Схема JSON строго такая:\n"
+    "Ты — эксперт по алкогольным брендам и продукту.\n"
+    "Опирайся ТОЛЬКО на переданные источники (RAG). Если факта нет — ставь null.\n"
+    "Верни СТРОГО ОДИН JSON-объект без префиксов/суффиксов/Markdown/HTML.\n"
+    "Схема JSON:\n"
     "{\n"
-    '  "name": string,                      \n'
-    '  "basics": {                          \n'
-    '    "category": string | null,         \n'
-    '    "country":  string | null,         \n'
-    '    "abv":      string | null          \n'
-    '  },                                    \n'
-    '  "taste":        string | null,       \n'
-    '  "serve":        string | null,       \n'
-    '  "pairing":      string | null,       \n'
-    '  "cocktails":    string[] | null,     \n'
-    '  "facts":        string[] | null,     \n'
-    '  "sales_script": string[] | null,     \n'
-    '  "sources":      string[] | null      \n'
+    '  "name": string,\n'
+    '  "basics": {"category": string|null, "country": string|null, "abv": string|null},\n'
+    '  "taste": string|null,\n'
+    '  "serve": string|null,\n'
+    '  "pairing": string|null,\n'
+    '  "cocktails": string[]|null,\n'
+    '  "facts": string[]|null,\n'
+    '  "sales_script": string[]|null,\n'
+    '  "sources": string[]|null\n'
     "}\n"
-    "Требования: на русском; никаких оценочных эпитетов и сравнений; не выдумывай данные; "
-    "кратко, по делу. 'sources' — список URL из переданных источников, если они были.\n"
+    "Требования: русский язык, никаких сравнений/оценок, не выдумывай.\n"
 )
 
+# 2) Для playbook “торгового представителя” (НЕ JSON, сразу HTML)
+_SYSTEM_TRADE = (
+    "Ты — торговый представитель алкогольной компании.\n"
+    "Отвечай кратко и структурно в HTML (для Telegram). Разрешены теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>.\n"
+    "Решай задачу для всех каналов (HoReCa, розница, e-commerce, duty-free). "
+    "Если канал указан — адаптируй под него; если нет — сначала универсально, затем по 1–2 пунктам для каждого канала.\n"
+    "Не сравнивай бренды и не указывай цены. Не выдумывай факты.\n"
+    "Структура:\n"
+    "<b>Цель</b>: что продвигаем и где (1 строка)\n"
+    "<b>Дистрибуция и листинг</b>: 2–3 пункта (SKU/категория/полка)\n"
+    "<b>Мерчандайзинг</b>: 3–5 пунктов (полка, фейсинги, вторичные точки, холод)\n"
+    "<b>Промо и POSM</b>: 2–4 пункта (механики, доп.материалы)\n"
+    "<b>Обучение персонала</b>: 2–3 пункта (скрипты/знания о продукте)\n"
+    "<b>Возражения и ответы</b>: 3–4 пары\n"
+    "<b>Кросс-продажи</b>: 2–3 идеи (сочетания, миксеры, наборы)\n"
+    "<b>Юридически</b>: 18+ и ответственное потребление\n"
+)
+
+# ---------- Утилиты ----------
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -66,7 +81,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(raw)
     except Exception:
-        # иногда кавычки «ёлочки» / типографские
+        # типографские кавычки → обычные
         raw = (raw
                .replace("\u201c", '"').replace("\u201d", '"')
                .replace("\u00ab", '"').replace("\u00bb", '"'))
@@ -110,30 +125,18 @@ def _pack_context(results_or_chunks: Any) -> tuple[str, List[str]]:
 
     return "нет данных", urls
 
-# ---------- НОРМАЛИЗАТОР (если модель вдруг вернула русские ключи) ----------
 def _normalize_schema(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Приводим возможные русские ключи к ожидаемой схеме."""
     if not isinstance(d, dict):
         return {}
-    # уже правильная схема?
     if "name" in d and "basics" in d:
         return d
 
-    # возможные русские ключи → англ. схема
     name = d.get("name") or d.get("название") or d.get("бренд") or ""
-    category = None
-    country  = None
-    abv      = None
-
-    # basics может быть как объект, так и россыпь полей
-    basics_ru = d.get("basics") or {}
-    if isinstance(basics_ru, dict):
-        category = basics_ru.get("category") or basics_ru.get("категория")
-        country  = basics_ru.get("country")  or basics_ru.get("страна")
-        abv      = basics_ru.get("abv")      or basics_ru.get("крепость")
-
-    category = category or d.get("категория")
-    country  = country  or d.get("страна")
-    abv      = abv      or d.get("крепость")
+    basics = d.get("basics") if isinstance(d.get("basics"), dict) else {}
+    category = (basics.get("category") if basics else None) or d.get("категория")
+    country  = (basics.get("country")  if basics else None) or d.get("страна")
+    abv      = (basics.get("abv")      if basics else None) or d.get("крепость")
 
     taste    = d.get("taste") or d.get("дегустационные_ноты") or d.get("ноты")
     serve    = d.get("serve") or d.get("подача")
@@ -165,13 +168,37 @@ def _normalize_schema(d: Dict[str, Any]) -> Dict[str, Any]:
         "sources": sources if isinstance(sources, list) else (None if sources is None else [str(sources)]),
     }
 
+def _is_sparse(d: Dict[str, Any]) -> bool:
+    """Почти пустой ответ?"""
+    if not isinstance(d, dict):
+        return True
+    b = d.get("basics") or {}
+    has_basics = any([b.get("category"), b.get("country"), b.get("abv")])
+    has_content = any([d.get("taste"), d.get("facts"), d.get("serve"), d.get("pairing")])
+    return not (has_basics or has_content)
+
+def _smart_trim(text: str, limit: int) -> str:
+    """Аккуратное укорачивание под лимит: режем по ближайшему разделителю."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # ищем удобную границу
+    for sep in ("\n•", ".</", ". ", "\n", "; ", "— ", ", "):
+        i = cut.rfind(sep)
+        if i >= 0 and i >= limit * 0.6:
+            cut = cut[:i + (0 if sep in ("\n•", "\n") else len(sep.strip()))]
+            break
+    cut = cut.rstrip()
+    if not cut.endswith("…"):
+        cut += "…"
+    return cut
+
 # ---------- РЕНДЕР КОМПАКТНОГО HTML ----------
-def _render_card_html(d: Dict[str, Any]) -> str:
+def _render_card_html(d: Dict[str, Any], limit: int = 950) -> str:
     def esc(s: str) -> str:
         return (s or "").strip()
 
     name = esc(d.get("name", ""))
-
     b = d.get("basics", {}) or {}
     basics = []
     if b.get("category"): basics.append(f"Категория: {esc(b.get('category'))}")
@@ -213,15 +240,12 @@ def _render_card_html(d: Dict[str, Any]) -> str:
         lines.append("Источники: " + tail)
 
     card = "\n".join(lines).strip()
-    if len(card) > 1000:  # лимит подписи для Telegram
-        card = card[:1000].rstrip() + "…"
-    return card
+    return _smart_trim(card, limit)
 
-# ---------- Основной генератор карточки (JSON -> HTML) ----------
+# ---------- Основной генератор карточки ----------
 async def generate_caption_with_gemini(query: str, results_or_chunks: Optional[Any]) -> str:
     """
-    Просим у модели СТРОГО JSON по нужной схеме, парсим, нормализуем и рендерим HTML.
-    На вход можно давать KB-чанки или CSE-результаты.
+    Просим у модели СТРОГО JSON по нужной схеме; если ответ «скудный» — фолбэк из веб-результатов.
     """
     if not have_gemini():
         return "<b>LLM не настроен.</b>"
@@ -258,57 +282,41 @@ async def generate_caption_with_gemini(query: str, results_or_chunks: Optional[A
         raw = ""
 
     data = _extract_json(raw)
-    if not data:
-        # минимальный фолбэк (если вдруг ответ не JSON)
+    data = _normalize_schema(data) if data else {}
+
+    # если JSON пустой/скудный — фолбэк из веб-результатов (тот же формат карточки)
+    if _is_sparse(data):
+        try:
+            # лёгкий фолбэк: соберём короткую сводку из сниппетов CSE
+            from app.services.ai_google import build_caption_from_results
+            if isinstance(results_or_chunks, dict) and results_or_chunks.get("results"):
+                return _smart_trim(build_caption_from_results(query, results_or_chunks), 950)
+        except Exception as e:
+            log.warning("Google fallback failed: %s", e)
+        # минимальная заглушка
         data = {
             "name": query,
             "basics": {"category": None, "country": None, "abv": None},
-            "taste": None,
-            "serve": None,
-            "pairing": None,
-            "cocktails": None,
             "facts": ["нет данных по предоставленным источникам."],
-            "sales_script": [
-                "Уточните предпочтения гостя (сладость/ароматика/крепость).",
-                "Предложите короткую классику (Old Fashioned / Sour) или хайболл.",
-            ],
             "sources": ctx_urls[:3] if ctx_urls else None,
         }
 
-    # Нормализуем схему (если пришли русские ключи и т.п.)
-    data = _normalize_schema(data)
-
-    # Если модель не вернула sources — добавим из контекста
     if not data.get("sources") and ctx_urls:
         data["sources"] = ctx_urls[:3]
 
-    html = _render_card_html(data)
-    return html
+    return _render_card_html(data, limit=950)
 
-# ---------- Тренерский «playbook» (оставлен) ----------
+# ---------- Тренерский «playbook» (Торговый представитель) ----------
 async def generate_sales_playbook_with_gemini(query: str, outlet: str | None, brand: str | None) -> str:
     """
-    Короткий тренерский разбор: как продавать указанный продукт в заданном формате точки.
-    Без сравнений/конкурентов/цен. HTML совместим с Telegram.
+    Короткий разбор “как продвигать” — от лица торгового представителя (все каналы).
+    Возвращает HTML для Telegram. Ограничиваем длину, чтобы не резалось.
     """
     if not have_gemini():
         return "LLM не настроен."
 
-    system = (
-        "Ты — тренер по продажам алкоголя для HoReCa и розницы.\n"
-        "Отвечай кратко и структурно в HTML для Telegram. Разрешены теги: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <br>.\n"
-        "Запрещены сравнения с другими брендами и цены. Не выдумывай факты.\n"
-        "Структура:\n"
-        "<b>Цель</b>: что продаём и где (1 строка)\n"
-        "<b>Кому</b>: портрет покупателя/гостя (2–3 пункта)\n"
-        "<b>Аргументы</b>: 4–6 коротких буллитов\n"
-        "<b>Как предложить</b>: 2–3 реплики продавца\n"
-        "<b>Возражения и ответы</b>: 3–4 пары\n"
-        "<b>Доп. продажи</b>: 2–3 идеи\n"
-        "<b>Юридически</b>: 18+ и ответственное потребление\n"
-    )
-    topic = f"Запрос: {query}\nМесто: {outlet or 'не указано'}\nБренд: {brand or 'не указан'}"
-    prompt = system + "\n\n" + topic + "\nОтвет дай строго в HTML без лишних вступлений."
+    topic = f"Запрос: {query}\nКанал/место: {outlet or 'не указано'}\nБренд/категория: {brand or 'не указан'}"
+    prompt = _SYSTEM_TRADE + "\n\n" + topic + "\nОтвет дай строго в HTML без лишних вступлений."
 
     def _call_new():
         client = genai.Client(api_key=_GEMINI_KEY)
@@ -328,7 +336,8 @@ async def generate_sales_playbook_with_gemini(query: str, outlet: str | None, br
             resp = await asyncio.to_thread(_call_new)
         else:
             resp = await asyncio.to_thread(_call_old)
-        return (getattr(resp, "text", "") or "Не удалось сгенерировать ответ.").strip()
+        html = (getattr(resp, "text", "") or "Не удалось сгенерировать ответ.").strip()
+        return _smart_trim(html, 950)
     except Exception as e:
         log.warning("Gemini playbook error: %s", e)
         return "Не удалось сгенерировать ответ."
