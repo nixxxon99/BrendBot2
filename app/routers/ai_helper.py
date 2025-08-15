@@ -1,4 +1,4 @@
-# app/routers/ai_helper.py
+# app/routers/ai_helper.py — OFFLINE ONLY (без веба и без local JSON)
 from __future__ import annotations
 
 import asyncio
@@ -6,54 +6,36 @@ import time
 import logging
 import re
 import difflib
+import json
+from pathlib import Path
 from contextlib import suppress
-from typing import Optional
-from collections import Counter, defaultdict
-from urllib.parse import urlparse
+from typing import Optional, Tuple
 
 from aiogram import Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.types import KeyboardButton
 
-# ---- метрики / sales-интенты ----
+# ---- метрики / sales-интенты (оставим как было) ----
 from app.services.stats import ai_inc, ai_observe_ms
 from app.services.sales_intents import detect_sales_intent, suggest_any_in_category
 
-# ---- локальная база (JSON) ----
-from app.services.brands import exact_lookup, get_brand, fuzzy_suggest
-try:
-    from app.services.brands import smart_lookup as _smart_lookup
-except Exception:
-    _smart_lookup = None
-
-# ---- KB / RAG (опционально) ----
-try:
-    from app.services.knowledge import retrieve as kb_retrieve
-except Exception:
-    kb_retrieve = None
-
+# ---- KB / RAG (опционально; если модуля нет, используем локальный загрузчик) ----
 try:
     from app.services.knowledge import find_record as kb_find_record, build_caption_from_kb
 except Exception:
     kb_find_record = None
     def build_caption_from_kb(_): return ""
 
-# ---- веб-поиск / картинки (синхронные функции!) ----
-from app.services.ai_google import web_search_brand, image_search_brand
-
-# ---- LLM (опционально) ----
 try:
-    from app.services.ai_gemini import (
-        generate_caption_with_gemini,
-        generate_sales_playbook_with_gemini,
-    )
+    from app.services.knowledge import retrieve as kb_retrieve
+except Exception:
+    kb_retrieve = None
+
+# ---- LLM (по желанию; используется ТОЛЬКО поверх KB, а не веба) ----
+try:
+    from app.services.ai_gemini import generate_caption_with_gemini, generate_sales_playbook_with_gemini
 except Exception:
     generate_caption_with_gemini = None
     generate_sales_playbook_with_gemini = None
@@ -83,7 +65,7 @@ def _mark_used(uid: int):
     _USER_LAST[uid] = time.time()
 
 # =========================
-# Клавиатуры и тексты (берём из menus.py)
+# Клавиатуры и тексты
 # =========================
 try:
     from app.keyboards.menus import (
@@ -139,235 +121,99 @@ async def _typing_pulse(m: Message, stop_evt: asyncio.Event):
         pass
 
 # =========================
-# Утилиты: нормализация / KB-имена / угадывание бренда
+# OFFLINE KB: простой загрузчик ingested_kb.json и поиск по алиасам
 # =========================
-def _normalize_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def _kb_brand_names() -> list[str]:
-    try:
-        from pathlib import Path
-        import json
-        p = Path("data/brands_kb.json")
-        if not p.exists():
-            return []
-        data = json.loads(p.read_text(encoding="utf-8"))
-        names: list[str] = []
-        if isinstance(data, list):
-            for it in data:
-                n = (it.get("brand") or "").strip()
-                if n:
-                    names.append(n)
-        elif isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    names.append((v.get("brand") or k).strip())
-        return [n for n in names if n]
-    except Exception:
-        return []
-
-def _guess_brand(q: str) -> Optional[str]:
-    e = exact_lookup(q)
-    if e:
-        return e
-    if _smart_lookup:
-        try:
-            s = _smart_lookup(q)
-            if s:
-                return s
-        except Exception:
-            pass
-    else:
-        try:
-            cand = fuzzy_suggest(q, limit=1)
-            if cand and cand[0][1] >= 0.72:
-                return cand[0][0]
-        except Exception:
-            pass
-    cand = _kb_brand_names()
-    if not cand:
-        return None
-    norm = _normalize_text(q).lower()
-    for name in cand:
-        if name.lower() in norm or norm in name.lower():
-            return name
-    match = difflib.get_close_matches(norm, [c.lower() for c in cand], n=1, cutoff=0.72)
-    if match:
-        lower2real = {c.lower(): c for c in cand}
-        return lower2real.get(match[0])
-    return None
-
-# =========================
-# Мульти-источник: объединение фактов из нескольких страниц
-# =========================
-_ALLOWED_IMG_DOMAIN_ORDER = [
-    "newxo.kz", "luxalcomarket.kz", "winestyle.ru", "decanter.ru", "ru.inshaker.com"
+_KB_CACHE: list[dict] = []
+_KB_PATHS = [
+    Path("data/ingested_kb.json"),
+    Path("data/kb/winespecialist.json"),  # если появятся site-packs
 ]
 
-def _norm(s): return (s or "").strip()
-
-def _domain_rank(u: str) -> int:
-    try:
-        host = urlparse(u).hostname or ""
-    except Exception:
-        host = ""
-    for i, d in enumerate(_ALLOWED_IMG_DOMAIN_ORDER):
-        if d in host:
-            return i
-    return 999
-
-def _parse_abv(abv) -> Optional[str]:
-    if not abv:
-        return None
-    import re as _re
-    m = _re.search(r"(\d{1,2}(?:[\.,]\d{1,2})?)\s*%?", str(abv))
-    if not m:
-        return None
-    val = m.group(1).replace(",", ".")
-    try:
-        f = float(val)
-        if 10 <= f <= 90:
-            return f"{int(f) if f.is_integer() else f}%"
-    except Exception:
-        pass
-    return None
-
-def _pick_majority(values: list[str]) -> Optional[str]:
-    vals = [_norm(v) for v in values if _norm(v)]
-    if not vals:
-        return None
-    c = Counter(vals)
-    return c.most_common(1)[0][0]
-
-def _merge_notes(list_of_lists: list[list[str]], limit: int = 6) -> list[str]:
-    c = Counter()
-    for arr in list_of_lists:
-        for note in (arr or []):
-            n = _norm(note).lower()
-            if n:
-                c[n] += 1
-    top = [k for k, _ in c.most_common(limit)]
-    return [t.capitalize() for t in top]
-
-def _dedup_facts(facts_lists: list[list[str]], limit: int = 4) -> list[str]:
-    seen = set()
+def _load_kb_once():
+    global _KB_CACHE
+    if _KB_CACHE:
+        return
     out = []
-    for arr in facts_lists:
-        for f in (arr or []):
-            norm = _norm(f)
-            if norm and norm.lower() not in seen:
-                seen.add(norm.lower())
-                out.append(norm)
-                if len(out) >= limit:
-                    return out
-    return out
+    for p in _KB_PATHS:
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    out.extend(data)
+            except Exception as e:
+                log.warning("[KB] read fail %s: %s", p, e)
+    _KB_CACHE = out
 
-def _pick_best_image(urls: list[str]) -> Optional[str]:
-    if not urls:
-        return None
-    candidates = [u for u in urls if _norm(u)]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda u: (_domain_rank(u), -len(u)))[0]
+def _all_names(rec: dict) -> list[str]:
+    names = set()
+    for k in ("name", "brand", "title"):
+        v = (rec.get(k) or "").strip()
+        if v:
+            names.add(v)
+    for a in rec.get("aliases") or []:
+        vv = (a or "").strip()
+        if vv:
+            names.add(vv)
+    return list(names)
 
-def _to_struct_fields(d: dict) -> dict:
-    """
-    Приводим разные форматы extractor'а к единому:
-    category, country, abv, tasting_notes(list), facts(list), image_url, sources(list)
-    """
-    basics = d.get("basics") or {}
-    category = d.get("category") or basics.get("category")
-    country  = d.get("country") or basics.get("country")
-    abv_raw  = d.get("abv") or basics.get("abv")
-    abv = _parse_abv(abv_raw)
+def _kb_find_local(query: str) -> Tuple[Optional[dict], Optional[str]]:
+    """ищем лучшую запись по точному совпадению или ближайшему алиасу"""
+    _load_kb_once()
+    q = (query or "").strip().lower()
+    if not q:
+        return None, None
+    best = None
+    best_name = None
+    best_score = 0.0
 
-    # tasting
-    notes = d.get("tasting_notes")
-    if not notes:
-        taste = d.get("taste") or ""
-        # очень мягкий парсинг по запятым
-        if isinstance(taste, str) and "," in taste:
-            notes = [t.strip() for t in taste.split(",") if t.strip()]
-    if isinstance(notes, str):
-        notes = [notes]
+    for rec in _KB_CACHE:
+        names = _all_names(rec)
+        # точное/вхождение
+        for n in names:
+            nlow = n.lower()
+            if nlow == q or q in nlow or nlow in q:
+                return rec, n  # мгновенно
+        # близость
+        ratio = max([difflib.SequenceMatcher(a=q, b=n.lower()).ratio() for n in names] + [0.0])
+        if ratio > best_score:
+            best_score = ratio
+            best = rec
+            best_name = names[0] if names else None
 
-    facts = d.get("facts") or []
-    if isinstance(facts, str):
-        facts = [facts]
+    if best and best_score >= 0.72:
+        return best, best_name
+    return None, None
 
-    image_url = d.get("image_url")
-    sources = d.get("sources") or []
-    if isinstance(sources, str):
-        sources = [sources]
+def _caption_from_rec(rec: dict, display_name: Optional[str] = None) -> str:
+    name = display_name or rec.get("name") or rec.get("brand") or "Бренд"
+    category = rec.get("category")
+    country  = rec.get("country")
+    abv      = rec.get("abv")
+    notes    = rec.get("tasting_notes") or []
+    facts    = rec.get("facts") or []
+    sources  = rec.get("sources") or []
 
-    return {
-        "category": category,
-        "country": country,
-        "abv": abv,
-        "tasting_notes": notes or [],
-        "facts": facts or [],
-        "image_url": image_url,
-        "sources": sources,
-    }
+    lines = [f"<b>{name}</b>"]
+    meta_bits = [category, country, abv]
+    meta = " | ".join([x for x in meta_bits if x])
+    if meta:
+        lines.append("• " + meta)
+    if notes:
+        lines.append("• Профиль: " + ", ".join([str(n) for n in notes])[:300])
+    for f in facts[:4]:
+        lines.append("• " + str(f))
+    if sources:
+        refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(sources[:5])])
+        lines.append("Источники: " + refs)
+    return "\n".join(lines)
 
-def _merge_collected(collected: list[dict]) -> dict:
-    """
-    На вход: список извлечений с разных страниц (каждый может иметь разную структуру).
-    На выход: объединённый словарь полей + top источники.
-    """
-    if not collected:
-        return {}
-
-    fields = defaultdict(list)
-    srcs_all = []
-    for e in collected:
-        st = _to_struct_fields(e)
-        for k, v in st.items():
-            if v:
-                fields[k].append(v)
-        # в приоритет ставим source_url и все sources из записи
-        if "source_url" in e and e["source_url"]:
-            srcs_all.append(e["source_url"])
-        for s in st.get("sources") or []:
-            srcs_all.append(s)
-
-    merged = {}
-    merged["category"] = _pick_majority(fields["category"])
-    merged["country"]  = _pick_majority(fields["country"])
-
-    # abv
-    abv_norms = list(filter(None, (_parse_abv(v if isinstance(v, str) else (v[0] if isinstance(v, list) else v)) for v in fields["abv"])))
-    merged["abv"] = _pick_majority(abv_norms) or (abv_norms[0] if abv_norms else None)
-
-    # tasting notes
-    merged["tasting_notes"] = _merge_notes(fields["tasting_notes"], limit=6)
-
-    # facts
-    merged["facts"] = _dedup_facts(fields["facts"], limit=4)
-
-    # image
-    imgs = []
-    for group in fields["image_url"]:
-        if isinstance(group, list):
-            imgs.extend(group)
-        else:
-            imgs.append(group)
-    merged["image_url"] = _pick_best_image(imgs)
-
-    # sources (уникальные до 5)
-    uniq = []
-    seen = set()
-    for s in srcs_all:
-        if s and s not in seen:
-            uniq.append(s)
-            seen.add(s)
-        if len(uniq) >= 5:
-            break
-    merged["sources"] = uniq
-
-    return merged
+def _photo_from_rec(rec: dict) -> Optional[str]:
+    img = rec.get("image_url")
+    if isinstance(img, list):
+        return next((u for u in img if isinstance(u, str) and u.strip()), None)
+    if isinstance(img, str):
+        return img
+    return None
 
 # =========================
 # Вход/выход из AI-режима
@@ -377,8 +223,8 @@ def _merge_collected(collected: list[dict]) -> dict:
 async def ai_mode_msg(m: Message):
     AI_USERS.add(m.from_user.id)
     await m.answer(
-        "AI-режим включён. Напишите бренд или вопрос.\n"
-        "Приоритет: <b>локальная база → KB → веб</b>.",
+        "AI-режим включён. Работаем <b>только из оффлайн-базы</b> (ingested_kb.json). "
+        "Чтобы добавить данные — пополни seed_urls.json и запусти GitHub Actions → Ingest.",
         parse_mode="HTML",
         reply_markup=menu_ai_exit_kb(),
     )
@@ -389,8 +235,7 @@ async def ai_mode_cb(cb: CallbackQuery):
     with suppress(Exception):
         await cb.answer()
     await cb.message.answer(
-        "AI-режим включён. Напишите бренд или вопрос.\n"
-        "Приоритет: <b>локальная база → KB → веб</b>.",
+        "AI-режим включён. Работаем <b>только из оффлайн-базы</b> (ingested_kb.json).",
         parse_mode="HTML",
         reply_markup=menu_ai_exit_kb(),
     )
@@ -410,7 +255,7 @@ async def ai_mode_off(ev):
         await ev.answer("AI-режим выключен.")
 
 # =========================
-# Главный AI-хендлер
+# Главный AI-хендлер (OFFLINE ONLY)
 # =========================
 @router.message(lambda m: m.from_user.id in AI_USERS and m.text is not None)
 async def handle_ai(m: Message):
@@ -427,13 +272,12 @@ async def handle_ai(m: Message):
         await _answer_ai(m, m.text.strip())
 
 async def _answer_ai(m: Message, text: str):
-    q = _normalize_text(text)
+    q = (text or "").strip()
     if not q:
         await m.answer("Напишите запрос или название бренда.")
         return
 
-    # ====== РАННИЕ ИНТЕНТЫ ======
-    # 1) «Как продать …»
+    # ====== РАННИЕ ИНТЕНТЫ (оставляем) ======
     is_sales, outlet, brand_for_sales = detect_sales_intent(q)
     if is_sales:
         html = ""
@@ -441,7 +285,7 @@ async def _answer_ai(m: Message, text: str):
             with suppress(Exception):
                 html = await generate_sales_playbook_with_gemini(q, outlet, brand_for_sales)
         if not html:
-            brand_hint = brand_for_sales or _guess_brand(q) or q
+            brand_hint = brand_for_sales or q
             html = (
                 f"<b>Как продавать: {brand_hint}</b>\n"
                 f"• Уточни вкус покупателя (сладость/сухость; ваниль/фрукты/дым).\n"
@@ -452,25 +296,19 @@ async def _answer_ai(m: Message, text: str):
         await m.answer(_sanitize_caption(html), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
         return
 
-    # 2) «Любой/неважно какой <категория>»
     any_res = suggest_any_in_category(q)
     if any_res:
         display_cat, names = any_res
         first = names[0]
-        item = get_brand(first)
-        caption = item["caption"] if item else f"<b>{first}</b>\n• Нет локальной карточки."
-        photo_id = (item or {}).get("photo_file_id") or (item or {}).get("image_url")
+        # даже тут — ищем только в KB
+        rec, disp = _kb_find_local(first)
+        caption = _sanitize_caption(_caption_from_rec(rec, disp)) if rec else f"<b>{first}</b>\n• Нет записи в оффлайн-БЗ."
+        photo = _photo_from_rec(rec) if rec else None
 
-        if not photo_id:
-            with suppress(Exception):
-                img = image_search_brand(first + " бутылка этикетка")
-                if isinstance(img, dict):
-                    photo_id = img.get("contentUrl") or img.get("contextLink")
-
-        if photo_id:
-            await m.answer_photo(photo=photo_id, caption=_sanitize_caption(caption), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        if photo:
+            await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
         else:
-            await m.answer(_sanitize_caption(caption), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+            await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 
         try:
             kb = ReplyKeyboardBuilder()
@@ -485,267 +323,112 @@ async def _answer_ai(m: Message, text: str):
         return
     # ====== КОНЕЦ РАННИХ ИНТЕНТОВ ======
 
+    # индикация "печатает…"
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
     t0 = time.monotonic()
 
     try:
-        # 1) Локальная JSON карточка
-        name = _smart_lookup(q) if _smart_lookup else None
-        if not name:
-            name = exact_lookup(q)
-        if not name:
-            with suppress(Exception):
-                cand = fuzzy_suggest(q, limit=1)
-                if cand and cand[0][1] >= 0.72:
-                    name = cand[0][0]
+        ai_inc("ai.query", tags={"intent": "brand"})
 
-        if name:
-            ai_inc("ai.query", tags={"intent": "brand"})
-            item = get_brand(name)
-            if item:
-                caption = _sanitize_caption(item["caption"])
-                photo_id = item.get("photo_file_id") or item.get("image_url")
-
-                try:
-                    if photo_id:
-                        await m.answer_photo(
-                            photo=photo_id,
-                            caption=caption,
-                            parse_mode="HTML",
-                            reply_markup=menu_ai_exit_kb(),
-                        )
-                    else:
-                        await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-                except TelegramBadRequest:
-                    ai_inc("ai.error", tags={"stage": "tg_parse"})
-                    with suppress(Exception):
-                        await m.answer(caption, reply_markup=menu_ai_exit_kb())
-
-                stop_typing.set()
-                with suppress(Exception):
-                    await typing_task
-                dt_ms = (time.monotonic() - t0) * 1000
-                ai_inc("ai.source", tags={"source": "local"})
-                ai_inc("ai.answer", tags={"intent": "brand", "source": "local"})
-                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "local"})
-                log.info("[AI] local card in %.2fs", dt_ms / 1000.0)
-                return
-
-        # 2) KB-first (прямая карточка)
-        brand_guess = _guess_brand(q)
+        # 1) Ищем прямо запись в KB модулем (если есть)
+        rec = None
+        disp_name = None
         if kb_find_record:
             try:
-                rec = kb_find_record(q, brand_hint=brand_guess)
-            except TypeError:
-                rec = kb_find_record(q)
-            if rec:
-                caption = _sanitize_caption(build_caption_from_kb(rec))
-                try:
-                    await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-                except TelegramBadRequest:
-                    await m.answer(caption, reply_markup=menu_ai_exit_kb())
+                tmp = kb_find_record(q)
+                if tmp:
+                    rec = tmp
+                    disp_name = (tmp.get("name") or tmp.get("brand"))
+            except Exception:
+                rec = None
 
-                stop_typing.set()
+        # 2) Наш локальный поиск по ingested_kb.json
+        if rec is None:
+            rec, disp_name = _kb_find_local(q)
+
+        # 3) Если есть — формируем карточку без веба
+        if rec:
+            # сначала красивый caption из KB-модуля, если доступен
+            if build_caption_from_kb != (lambda _: ""):
                 with suppress(Exception):
-                    await typing_task
-                dt_ms = (time.monotonic() - t0) * 1000
-                ai_inc("ai.source", tags={"source": "kb"})
-                ai_inc("ai.answer", tags={"intent": "brand", "source": "kb"})
-                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb"})
-                log.info("[AI] kb direct card in %.2fs", dt_ms / 1000.0)
-                return
+                    caption = _sanitize_caption(build_caption_from_kb(rec))
+                if not caption:
+                    caption = _sanitize_caption(_caption_from_rec(rec, disp_name))
+            else:
+                caption = _sanitize_caption(_caption_from_rec(rec, disp_name))
 
-        # 3) KB → LLM (если есть)
+            photo = _photo_from_rec(rec)
+
+            try:
+                if photo:
+                    await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+                else:
+                    await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+            except TelegramBadRequest:
+                await m.answer(caption, reply_markup=menu_ai_exit_kb())
+
+            stop_typing.set()
+            with suppress(Exception):
+                await typing_task
+            dt_ms = (time.monotonic() - t0) * 1000
+            ai_inc("ai.source", tags={"source": "kb_offline"})
+            ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline"})
+            ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline"})
+            log.info("[AI] offline KB card in %.2fs", dt_ms / 1000.0)
+            return
+
+        # 4) KB → LLM (если нужно «оживить» формулировку, но только из KB)
         if kb_retrieve and generate_caption_with_gemini:
             try:
-                kb = kb_retrieve(q, brand=brand_guess, top_k=8)
+                kb = kb_retrieve(q, top_k=8)
             except TypeError:
                 kb = kb_retrieve(q)
             if kb and kb.get("results"):
                 try:
-                    caption = await generate_caption_with_gemini(q, kb)
+                    caption = await generate_caption_with_gemini(
+                        q, kb,
+                        system_prompt=(
+                            "Ты кратко описываешь напиток строго по данным из локальной БЗ "
+                            "(результаты retrieval). Никаких догадок. Если чего-то нет — пиши 'н/д'. "
+                            "Дай 2–3 лаконичные фразы и 3–6 дегустационных нот списком."
+                        )
+                    )
                 except Exception:
                     caption = ""
-                caption = _sanitize_caption(caption) or "Нет фактов в KB."
+                caption = _sanitize_caption(caption) or "Нет фактов в оффлайн-БЗ."
                 await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 
                 stop_typing.set()
                 with suppress(Exception):
                     await typing_task
                 dt_ms = (time.monotonic() - t0) * 1000
-                ai_inc("ai.source", tags={"source": "kb"})
-                ai_inc("ai.answer", tags={"intent": "brand", "source": "kb"})
-                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb"})
-                log.info("[AI] kb gemini card in %.2fs", dt_ms / 1000.0)
+                ai_inc("ai.source", tags={"source": "kb_offline"})
+                ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline"})
+                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline"})
+                log.info("[AI] offline KB + Gemini in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 4) ВЕБ → мульти-источники → объединение → (LLM при нехватке) + картинка
-        with suppress(Exception):
-            ai_inc("ai.query", tags={"intent": "brand"})
-
-        try:
-            results = web_search_brand(q, top_k=8)  # без await
-        except Exception:
-            results = {}
-
-        # === Снимаем факты с нескольких страниц разрешённых доменов ===
-        collected = []
-        try:
-            from app.services.extractors import fetch_and_extract
-        except Exception:
-            fetch_and_extract = None
-
-        if fetch_and_extract:
-            for r in (results or {}).get("results", [])[:6]:
-                try:
-                    url = (r.get("url") if isinstance(r, dict) else None) or ""
-                    d = fetch_and_extract(brand_guess or q, [r], max_pages=2)
-                    if d and any(d.get(k) for k in ("basics", "taste", "facts", "image_url", "sources", "category", "country", "abv", "tasting_notes")):
-                        d = dict(d)
-                        if url:
-                            if "sources" in d and isinstance(d["sources"], list):
-                                if url not in d["sources"]:
-                                    d["sources"].insert(0, url)
-                            else:
-                                d["sources"] = [url]
-                        d["source_url"] = url
-                        collected.append(d)
-                except Exception as e:
-                    log.warning("[AI] extract fail: %s", e)
-
-        merged = _merge_collected(collected)
-
-        caption = ""
-        photo_url = None
-
-        # --- карточка без LLM на основе объединённых фактов ---
-        if merged and (merged.get("category") or merged.get("tasting_notes") or merged.get("facts")):
-            name2 = brand_guess or q
-            lines = [f"<b>{name2}</b>"]
-            meta_bits = [merged.get("category"), merged.get("country"), merged.get("abv")]
-            meta = " | ".join([x for x in meta_bits if x])
-            if meta:
-                lines.append("• " + meta)
-            notes = merged.get("tasting_notes") or []
-            if notes:
-                lines.append("• Профиль: " + ", ".join(notes[:6]))
-            for fct in (merged.get("facts") or [])[:4]:
-                if not fct.lower().startswith(("категория", "страна", "крепость")):
-                    lines.append("• " + fct)
-            srcs = merged.get("sources") or []
-            if srcs:
-                refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(srcs[:5])])
-                lines.append("Источники: " + refs)
-            caption = _sanitize_caption("\n".join(lines))
-            photo_url = merged.get("image_url")
-
-        # --- если фактов мало — аккуратно подключаем Gemini (строго по сниппетам) ---
-        if not caption and generate_caption_with_gemini:
-            try:
-                caption = await generate_caption_with_gemini(
-                    q,
-                    results or {},
-                    system_prompt=(
-                        "Ты кратко описываешь напиток строго по данным из переданных сниппетов "
-                        "с разрешённых доменов. Никаких догадок. Если чего-то нет — пиши 'н/д'. "
-                        "Дай 2–3 живые фразы (без воды), затем короткий список из 3–6 дегустационных нот."
-                    ),
-                )
-            except Exception:
-                caption = ""
-
-            caption = _sanitize_caption(caption)
-
-        # --- финальный фолбэк: сниппеты из результатов ---
-        if not caption:
-            items = (results or {}).get("results", [])
-            lines = []
-            if brand_guess:
-                lines.append(f"<b>{brand_guess}</b>")
-            for r in items[:5]:
-                name_ = r.get("name") or r.get("title") or ""
-                snip = r.get("snippet") or ""
-                if name_:
-                    lines.append(f"• {name_} — {snip}")
-            caption = _sanitize_caption("\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе.")
-
-        # --- Картинка: если не нашли у парсера, добираем через image_search ---
-        if not photo_url:
-            with suppress(Exception):
-                img = image_search_brand((brand_guess or q) + " бутылка этикетка")
-                if isinstance(img, dict):
-                    photo_url = img.get("contentUrl") or img.get("contextLink")
-
-        # --- Автосохранение URL в JSON (если нет file_id) ---
-        if photo_url:
-            try:
-                from app.services.brands import set_image_url_for_brand
-                set_image_url_for_brand(brand_guess or q, photo_url)
-            except Exception:
-                pass
-
-        # --- Отправка ответа ---
-        try:
-            if photo_url:
-                await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-            else:
-                await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-        except TelegramBadRequest:
-            await m.answer(caption, reply_markup=menu_ai_exit_kb())
+        # 5) Ничего не нашли в оффлайн-БЗ — подсказываем, как «накормить»
+        help_text = (
+            "<b>Не нашёл в оффлайн-базе.</b>\n"
+            "Чтобы добавить бренд без веб-поиска:\n"
+            "1) Открой data/seed_urls.json и добавь точные карточки в \"exact_pages\".\n"
+            "2) Запусти GitHub → Actions → <i>Ingest allowed sites</i> с <b>run_all: true</b>.\n"
+            "3) Проверь, что data/ingested_kb.json обновился — и спроси бренд ещё раз."
+        )
+        await m.answer(help_text, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 
         stop_typing.set()
         with suppress(Exception):
             await typing_task
         dt_ms = (time.monotonic() - t0) * 1000
-        ai_inc("ai.source", tags={"source": "web"})
-        ai_inc("ai.answer", tags={"intent": "brand", "source": "web"})
-        ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "web"})
-        log.info("[AI] web card (multi-merge) in %.2fs", dt_ms / 1000.0)
+        ai_inc("ai.source", tags={"source": "kb_offline_miss"})
+        ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline_miss"})
+        ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline_miss"})
+        log.info("[AI] offline KB miss in %.2fs", dt_ms / 1000.0)
 
     finally:
         stop_typing.set()
         with suppress(Exception):
             await typing_task
-
-# =========================
-# Sales-интент (вспомогательная, если где-то пригодится)
-# =========================
-async def _answer_sales(
-    m: Message,
-    q: str,
-    outlet: str,
-    stop_typing: asyncio.Event,
-    typing_task: asyncio.Task,
-    t0: float,
-):
-    brand_guess = _guess_brand(q) or q
-    text = ""
-    if generate_sales_playbook_with_gemini:
-        try:
-            text = await generate_sales_playbook_with_gemini(q, outlet=outlet, brand=brand_guess)
-        except Exception:
-            text = ""
-    if not text:
-        text = (
-            f"<b>Как продавать: {brand_guess}</b>\n"
-            f"• Уточни вкус гостя (сладость/сухость; ваниль/фрукты/дым).\n"
-            f"• Предложи хайболл или короткую классику (Old Fashioned / Sour).\n"
-            f"• 1 фраза про происхождение/бочки — как история.\n"
-            f"• Апселл: большая порция/премиальная версия; кросс-селл: подходящая закуска."
-        )
-
-    text = _sanitize_caption(text, limit=1000)
-    try:
-        await m.answer(text, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-    except TelegramBadRequest:
-        await m.answer(text, reply_markup=menu_ai_exit_kb())
-
-    stop_typing.set()
-    with suppress(Exception):
-        await typing_task
-    dt_ms = (time.monotonic() - t0) * 1000
-    ai_inc("ai.source", tags={"source": "sales"})
-    ai_inc("ai.answer", tags={"intent": "sales", "source": "sales"})
-    ai_observe_ms("ai.latency", dt_ms, tags={"intent": "sales", "source": "sales"})
-    log.info("[AI] sales in %.2fs", dt_ms / 1000.0)
