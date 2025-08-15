@@ -317,10 +317,10 @@ async def _answer_ai(m: Message, text: str):
 
         if photo:
             caption = caption + "\n\n<i>Источник: оффлайн KB</i>"
-                await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=_quick_actions_kb(disp_name))
+            await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=_quick_actions_kb(disp_name))
         else:
             caption = caption + "\n\n<i>Источник: оффлайн KB</i>"
-                await m.answer(caption, parse_mode="HTML", reply_markup=_quick_actions_kb(disp_name))
+            await m.answer(caption, parse_mode="HTML", reply_markup=_quick_actions_kb(disp_name))
 
         try:
             kb = ReplyKeyboardBuilder()
