@@ -103,3 +103,24 @@ def fetch_and_extract(brand: str, results: Dict[str, Any], max_pages: int = 3) -
     out["facts"] = facts
 
     return out
+# --- MULTI-SOURCE WRAPPER: гоняем извлечение по нескольким результатам ---
+def fetch_and_extract_many(brand: str, results: list, max_pages: int = 2, top_k: int = 6) -> list:
+    """
+    Пробегаемся по top_k результатам (только разрешённые домены уже отфильтрованы выше),
+    на каждый вызываем существующий fetch_and_extract(...), собираем удачные извлечения.
+    Возвращаем список объектов-экстракций с проставленным source_url.
+    """
+    collected = []
+    try:
+        take = results[:top_k] if isinstance(results, list) else []
+        for r in take:
+            url = (r.get("url") if isinstance(r, dict) else None) or str(r)
+            # Переиспользуем твою функцию, но даём ей список из одного результата
+            data = fetch_and_extract(brand, [r], max_pages=max_pages)
+            if data and any(data.get(k) for k in ("abv", "tasting_notes", "facts", "category", "country", "image_url")):
+                data = dict(data)
+                data["source_url"] = url
+                collected.append(data)
+    except Exception as e:
+        print("[extractors] fetch_and_extract_many error:", e)
+    return collected
