@@ -8,6 +8,8 @@ import re
 import difflib
 from contextlib import suppress
 from typing import Optional
+from collections import Counter, defaultdict
+from urllib.parse import urlparse
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -44,7 +46,6 @@ except Exception:
     def build_caption_from_kb(_): return ""
 
 # ---- веб-поиск / картинки (синхронные функции!) ----
-# Если у тебя есть агрегатор web_search, можно поменять импорт на него.
 from app.services.ai_google import web_search_brand, image_search_brand
 
 # ---- LLM (опционально) ----
@@ -199,6 +200,176 @@ def _guess_brand(q: str) -> Optional[str]:
     return None
 
 # =========================
+# Мульти-источник: объединение фактов из нескольких страниц
+# =========================
+_ALLOWED_IMG_DOMAIN_ORDER = [
+    "newxo.kz", "luxalcomarket.kz", "winestyle.ru", "decanter.ru", "ru.inshaker.com"
+]
+
+def _norm(s): return (s or "").strip()
+
+def _domain_rank(u: str) -> int:
+    try:
+        host = urlparse(u).hostname or ""
+    except Exception:
+        host = ""
+    for i, d in enumerate(_ALLOWED_IMG_DOMAIN_ORDER):
+        if d in host:
+            return i
+    return 999
+
+def _parse_abv(abv) -> Optional[str]:
+    if not abv:
+        return None
+    import re as _re
+    m = _re.search(r"(\d{1,2}(?:[\.,]\d{1,2})?)\s*%?", str(abv))
+    if not m:
+        return None
+    val = m.group(1).replace(",", ".")
+    try:
+        f = float(val)
+        if 10 <= f <= 90:
+            return f"{int(f) if f.is_integer() else f}%"
+    except Exception:
+        pass
+    return None
+
+def _pick_majority(values: list[str]) -> Optional[str]:
+    vals = [_norm(v) for v in values if _norm(v)]
+    if not vals:
+        return None
+    c = Counter(vals)
+    return c.most_common(1)[0][0]
+
+def _merge_notes(list_of_lists: list[list[str]], limit: int = 6) -> list[str]:
+    c = Counter()
+    for arr in list_of_lists:
+        for note in (arr or []):
+            n = _norm(note).lower()
+            if n:
+                c[n] += 1
+    top = [k for k, _ in c.most_common(limit)]
+    return [t.capitalize() for t in top]
+
+def _dedup_facts(facts_lists: list[list[str]], limit: int = 4) -> list[str]:
+    seen = set()
+    out = []
+    for arr in facts_lists:
+        for f in (arr or []):
+            norm = _norm(f)
+            if norm and norm.lower() not in seen:
+                seen.add(norm.lower())
+                out.append(norm)
+                if len(out) >= limit:
+                    return out
+    return out
+
+def _pick_best_image(urls: list[str]) -> Optional[str]:
+    if not urls:
+        return None
+    candidates = [u for u in urls if _norm(u)]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda u: (_domain_rank(u), -len(u)))[0]
+
+def _to_struct_fields(d: dict) -> dict:
+    """
+    Приводим разные форматы extractor'а к единому:
+    category, country, abv, tasting_notes(list), facts(list), image_url, sources(list)
+    """
+    basics = d.get("basics") or {}
+    category = d.get("category") or basics.get("category")
+    country  = d.get("country") or basics.get("country")
+    abv_raw  = d.get("abv") or basics.get("abv")
+    abv = _parse_abv(abv_raw)
+
+    # tasting
+    notes = d.get("tasting_notes")
+    if not notes:
+        taste = d.get("taste") or ""
+        # очень мягкий парсинг по запятым
+        if isinstance(taste, str) and "," in taste:
+            notes = [t.strip() for t in taste.split(",") if t.strip()]
+    if isinstance(notes, str):
+        notes = [notes]
+
+    facts = d.get("facts") or []
+    if isinstance(facts, str):
+        facts = [facts]
+
+    image_url = d.get("image_url")
+    sources = d.get("sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+
+    return {
+        "category": category,
+        "country": country,
+        "abv": abv,
+        "tasting_notes": notes or [],
+        "facts": facts or [],
+        "image_url": image_url,
+        "sources": sources,
+    }
+
+def _merge_collected(collected: list[dict]) -> dict:
+    """
+    На вход: список извлечений с разных страниц (каждый может иметь разную структуру).
+    На выход: объединённый словарь полей + top источники.
+    """
+    if not collected:
+        return {}
+
+    fields = defaultdict(list)
+    srcs_all = []
+    for e in collected:
+        st = _to_struct_fields(e)
+        for k, v in st.items():
+            if v:
+                fields[k].append(v)
+        # в приоритет ставим source_url и все sources из записи
+        if "source_url" in e and e["source_url"]:
+            srcs_all.append(e["source_url"])
+        for s in st.get("sources") or []:
+            srcs_all.append(s)
+
+    merged = {}
+    merged["category"] = _pick_majority(fields["category"])
+    merged["country"]  = _pick_majority(fields["country"])
+
+    # abv
+    abv_norms = list(filter(None, (_parse_abv(v if isinstance(v, str) else (v[0] if isinstance(v, list) else v)) for v in fields["abv"])))
+    merged["abv"] = _pick_majority(abv_norms) or (abv_norms[0] if abv_norms else None)
+
+    # tasting notes
+    merged["tasting_notes"] = _merge_notes(fields["tasting_notes"], limit=6)
+
+    # facts
+    merged["facts"] = _dedup_facts(fields["facts"], limit=4)
+
+    # image
+    imgs = []
+    for group in fields["image_url"]:
+        if isinstance(group, list):
+            imgs.extend(group)
+        else:
+            imgs.append(group)
+    merged["image_url"] = _pick_best_image(imgs)
+
+    # sources (уникальные до 5)
+    uniq = []
+    seen = set()
+    for s in srcs_all:
+        if s and s not in seen:
+            uniq.append(s)
+            seen.add(s)
+        if len(uniq) >= 5:
+            break
+    merged["sources"] = uniq
+
+    return merged
+
+# =========================
 # Вход/выход из AI-режима
 # =========================
 @router.message(F.text == AI_ENTRY_TEXT)
@@ -270,7 +441,6 @@ async def _answer_ai(m: Message, text: str):
             with suppress(Exception):
                 html = await generate_sales_playbook_with_gemini(q, outlet, brand_for_sales)
         if not html:
-            # простой фолбэк, если LLM недоступен
             brand_hint = brand_for_sales or _guess_brand(q) or q
             html = (
                 f"<b>Как продавать: {brand_hint}</b>\n"
@@ -302,7 +472,6 @@ async def _answer_ai(m: Message, text: str):
         else:
             await m.answer(_sanitize_caption(caption), parse_mode="HTML", reply_markup=menu_ai_exit_kb())
 
-        # клавиатура с альтернативами
         try:
             kb = ReplyKeyboardBuilder()
             for n in names[:10]:
@@ -316,7 +485,6 @@ async def _answer_ai(m: Message, text: str):
         return
     # ====== КОНЕЦ РАННИХ ИНТЕНТОВ ======
 
-    # индикация "печатает…"
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
     t0 = time.monotonic()
@@ -412,52 +580,84 @@ async def _answer_ai(m: Message, text: str):
                 log.info("[AI] kb gemini card in %.2fs", dt_ms / 1000.0)
                 return
 
-        # 4) ВЕБ → (LLM или фолбэк) + картинка
+        # 4) ВЕБ → мульти-источники → объединение → (LLM при нехватке) + картинка
         with suppress(Exception):
             ai_inc("ai.query", tags={"intent": "brand"})
 
-        # ВАЖНО: web_search_brand и image_search_brand — синхронные!
         try:
-            results = web_search_brand(q)   # без await
+            results = web_search_brand(q, top_k=8)  # без await
         except Exception:
             results = {}
 
-        # === Пробуем достать факты со страниц разрешённых доменов ===
+        # === Снимаем факты с нескольких страниц разрешённых доменов ===
+        collected = []
         try:
             from app.services.extractors import fetch_and_extract
-            enriched = fetch_and_extract(brand_guess or q, results, max_pages=3)
         except Exception:
-            enriched = {}
+            fetch_and_extract = None
+
+        if fetch_and_extract:
+            for r in (results or {}).get("results", [])[:6]:
+                try:
+                    url = (r.get("url") if isinstance(r, dict) else None) or ""
+                    d = fetch_and_extract(brand_guess or q, [r], max_pages=2)
+                    if d and any(d.get(k) for k in ("basics", "taste", "facts", "image_url", "sources", "category", "country", "abv", "tasting_notes")):
+                        d = dict(d)
+                        if url:
+                            if "sources" in d and isinstance(d["sources"], list):
+                                if url not in d["sources"]:
+                                    d["sources"].insert(0, url)
+                            else:
+                                d["sources"] = [url]
+                        d["source_url"] = url
+                        collected.append(d)
+                except Exception as e:
+                    log.warning("[AI] extract fail: %s", e)
+
+        merged = _merge_collected(collected)
 
         caption = ""
         photo_url = None
 
-        # если что-то вытащили — соберём карточку без LLM
-        if enriched and (enriched.get("basics") or enriched.get("taste")):
-            name2 = enriched.get("name") or (brand_guess or q)
-            b = enriched.get("basics") or {}
+        # --- карточка без LLM на основе объединённых фактов ---
+        if merged and (merged.get("category") or merged.get("tasting_notes") or merged.get("facts")):
+            name2 = brand_guess or q
             lines = [f"<b>{name2}</b>"]
-            meta = " | ".join([x for x in [b.get("category"), b.get("country"), b.get("abv")] if x])
-            if meta: lines.append("• " + meta)
-            if enriched.get("taste"): lines.append("• Профиль: " + enriched["taste"])
-            for fct in (enriched.get("facts") or [])[:3]:
+            meta_bits = [merged.get("category"), merged.get("country"), merged.get("abv")]
+            meta = " | ".join([x for x in meta_bits if x])
+            if meta:
+                lines.append("• " + meta)
+            notes = merged.get("tasting_notes") or []
+            if notes:
+                lines.append("• Профиль: " + ", ".join(notes[:6]))
+            for fct in (merged.get("facts") or [])[:4]:
                 if not fct.lower().startswith(("категория", "страна", "крепость")):
                     lines.append("• " + fct)
-            srcs = enriched.get("sources") or []
+            srcs = merged.get("sources") or []
             if srcs:
-                refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(srcs[:3])])
+                refs = " ".join([f"<a href='{u}'>[{i+1}]</a>" for i, u in enumerate(srcs[:5])])
                 lines.append("Источники: " + refs)
             caption = _sanitize_caption("\n".join(lines))
-            photo_url = enriched.get("image_url")
+            photo_url = merged.get("image_url")
 
-        # если не хватило фактов — просим LLM по результатам
+        # --- если фактов мало — аккуратно подключаем Gemini (строго по сниппетам) ---
         if not caption and generate_caption_with_gemini:
             try:
-                caption = await generate_caption_with_gemini(q, results or {})
+                caption = await generate_caption_with_gemini(
+                    q,
+                    results or {},
+                    system_prompt=(
+                        "Ты кратко описываешь напиток строго по данным из переданных сниппетов "
+                        "с разрешённых доменов. Никаких догадок. Если чего-то нет — пиши 'н/д'. "
+                        "Дай 2–3 живые фразы (без воды), затем короткий список из 3–6 дегустационных нот."
+                    ),
+                )
             except Exception:
                 caption = ""
 
-        # финальный фолбэк по сниппетам
+            caption = _sanitize_caption(caption)
+
+        # --- финальный фолбэк: сниппеты из результатов ---
         if not caption:
             items = (results or {}).get("results", [])
             lines = []
@@ -468,17 +668,16 @@ async def _answer_ai(m: Message, text: str):
                 snip = r.get("snippet") or ""
                 if name_:
                     lines.append(f"• {name_} — {snip}")
-            caption = "\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе."
-        caption = _sanitize_caption(caption)
+            caption = _sanitize_caption("\n".join([l for l in lines if l]) or "Ничего не нашёл в вебе.")
 
-        # Картинка — если экстрактор не нашёл, доберём через image_search
+        # --- Картинка: если не нашли у парсера, добираем через image_search ---
         if not photo_url:
             with suppress(Exception):
                 img = image_search_brand((brand_guess or q) + " бутылка этикетка")
                 if isinstance(img, dict):
                     photo_url = img.get("contentUrl") or img.get("contextLink")
 
-        # === Автосохранение URL в JSON (если нет фото) ===
+        # --- Автосохранение URL в JSON (если нет file_id) ---
         if photo_url:
             try:
                 from app.services.brands import set_image_url_for_brand
@@ -486,7 +685,7 @@ async def _answer_ai(m: Message, text: str):
             except Exception:
                 pass
 
-        # Отправка ответа (один раз!)
+        # --- Отправка ответа ---
         try:
             if photo_url:
                 await m.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
@@ -502,7 +701,7 @@ async def _answer_ai(m: Message, text: str):
         ai_inc("ai.source", tags={"source": "web"})
         ai_inc("ai.answer", tags={"intent": "brand", "source": "web"})
         ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "web"})
-        log.info("[AI] web card in %.2fs", dt_ms / 1000.0)
+        log.info("[AI] web card (multi-merge) in %.2fs", dt_ms / 1000.0)
 
     finally:
         stop_typing.set()
