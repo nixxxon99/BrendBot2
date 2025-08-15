@@ -25,3 +25,26 @@
     "max_pages": 200
   }
 ]
+{
+  "exact_pages": [
+    "https://winestyle.ru/products/Jameson-Irish-Whiskey-0-7l.html",
+   https://decanter.ru/product/aerstone-land-cask-10-years-id135574
+    https://decanter.ru/product/campari-bitter-id1528
+    "https://ru.inshaker.com/cocktails/whiskey_sour"
+  ],
+  "categories": [
+    "https://winestyle.ru/categories/whisky/",
+    "https://newxo.kz/whisky/"
+    https://decanter.ru/whisky
+  ],
+  "sitemaps": [
+    "https://decanter.ru/sitemap.xml"
+    
+  ],
+  "deny_paths": [
+    "/news/",
+    "/blog/",
+    "/cart",
+    "/account"
+  ]
+}
