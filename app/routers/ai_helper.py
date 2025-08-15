@@ -1,4 +1,4 @@
-# app/routers/ai_helper.py — OFFLINE ONLY (без веба и без local JSON)
+# app/routers/ai_helper.py — OFFLINE ONLY (без веб-поиска)
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,7 @@ import difflib
 import json
 from pathlib import Path
 from contextlib import suppress
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,11 +17,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.types import KeyboardButton
 
-# ---- метрики / sales-интенты (оставим как было) ----
+# ---- метрики / sales-интенты ----
 from app.services.stats import ai_inc, ai_observe_ms
 from app.services.sales_intents import detect_sales_intent, suggest_any_in_category
 
-# ---- KB / RAG (опционально; если модуля нет, используем локальный загрузчик) ----
+# ---- KB / RAG (если модуль есть — используем; иначе fallback на локальный JSON) ----
 try:
     from app.services.knowledge import find_record as kb_find_record, build_caption_from_kb
 except Exception:
@@ -33,7 +33,7 @@ try:
 except Exception:
     kb_retrieve = None
 
-# ---- LLM (по желанию; используется ТОЛЬКО поверх KB, а не веба) ----
+# ---- LLM (используем ТОЛЬКО поверх локальной KB, не для веба) ----
 try:
     from app.services.ai_gemini import generate_caption_with_gemini, generate_sales_playbook_with_gemini
 except Exception:
@@ -92,11 +92,12 @@ _ALLOWED_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "br"}
 def _sanitize_caption(html: str, limit: int = 1000) -> str:
     if not html:
         return ""
-    html = re.sub(r"</?(?:h[1-6]|p|ul|ol|li)>", "", html, flags=re.I)
+    html = re.sub(r"</?(?:h[1-6]|p|ul|ol|li|div|span)>", "", html, flags=re.I)
     html = re.sub(r"<\s*strong\s*>", "<b>", html, flags=re.I)
     html = re.sub(r"<\s*/\s*strong\s*>", "</b>", html, flags=re.I)
     html = re.sub(r"<\s*em\s*>", "<i>", html, flags=re.I)
     html = re.sub(r"<\s*/\s*em\s*>", "</i>", html, flags=re.I)
+
     def _strip_tag(m):
         tag = m.group(1).lower()
         return m.group(0) if tag in _ALLOWED_TAGS else ""
@@ -121,19 +122,19 @@ async def _typing_pulse(m: Message, stop_evt: asyncio.Event):
         pass
 
 # =========================
-# OFFLINE KB: простой загрузчик ingested_kb.json и поиск по алиасам
+# OFFLINE KB (fallback): загрузка из JSON и поиск
 # =========================
-_KB_CACHE: list[dict] = []
+_KB_CACHE: List[dict] = []
 _KB_PATHS = [
-    Path("data/ingested_kb.json"),
-    Path("data/kb/winespecialist.json"),  # если появятся site-packs
+    Path("data/ingested_kb.json"),         # основной инжест
+    Path("data/kb/winespecialist.json"),   # дополнительные пакеты
 ]
 
-def _load_kb_once():
+def _load_kb_once(force: bool = False):
     global _KB_CACHE
-    if _KB_CACHE:
+    if _KB_CACHE and not force:
         return
-    out = []
+    out: List[dict] = []
     for p in _KB_PATHS:
         if p.exists():
             try:
@@ -143,8 +144,9 @@ def _load_kb_once():
             except Exception as e:
                 log.warning("[KB] read fail %s: %s", p, e)
     _KB_CACHE = out
+    log.info("[KB] loaded %d records", len(_KB_CACHE))
 
-def _all_names(rec: dict) -> list[str]:
+def _all_names(rec: dict) -> List[str]:
     names = set()
     for k in ("name", "brand", "title"):
         v = (rec.get(k) or "").strip()
@@ -156,50 +158,25 @@ def _all_names(rec: dict) -> list[str]:
             names.add(vv)
     return list(names)
 
-def _kb_find_local(query: str) -> Tuple[Optional[dict], Optional[str]]:
-    """ищем лучшую запись по точному совпадению или ближайшему алиасу"""
-    _load_kb_once()
-    q = (query or "").strip().lower()
-    if not q:
-        return None, None
-    best = None
-    best_name = None
-    best_score = 0.0
-
-    for rec in _KB_CACHE:
-        names = _all_names(rec)
-        # точное/вхождение
-        for n in names:
-            nlow = n.lower()
-            if nlow == q or q in nlow or nlow in q:
-                return rec, n  # мгновенно
-        # близость
-        ratio = max([difflib.SequenceMatcher(a=q, b=n.lower()).ratio() for n in names] + [0.0])
-        if ratio > best_score:
-            best_score = ratio
-            best = rec
-            best_name = names[0] if names else None
-
-    if best and best_score >= 0.72:
-        return best, best_name
-    return None, None
-
 def _caption_from_rec(rec: dict, display_name: Optional[str] = None) -> str:
     name = display_name or rec.get("name") or rec.get("brand") or "Бренд"
-    category = rec.get("category")
-    country  = rec.get("country")
-    abv      = rec.get("abv")
-    notes    = rec.get("tasting_notes") or []
+    basics = rec.get("basics") or {}
+    category = rec.get("category") or basics.get("category")
+    country  = rec.get("country")  or basics.get("country")
+    abv      = rec.get("abv")      or basics.get("abv")
+    notes    = rec.get("tasting_notes") or rec.get("taste") or []
+    if isinstance(notes, str):
+        notes = [notes]
     facts    = rec.get("facts") or []
     sources  = rec.get("sources") or []
 
     lines = [f"<b>{name}</b>"]
-    meta_bits = [category, country, abv]
-    meta = " | ".join([x for x in meta_bits if x])
-    if meta:
-        lines.append("• " + meta)
+    meta_bits = [x for x in (category, country, abv) if x]
+    if meta_bits:
+        lines.append("• " + " | ".join(meta_bits))
     if notes:
-        lines.append("• Профиль: " + ", ".join([str(n) for n in notes])[:300])
+        joined = ", ".join([str(n) for n in notes])
+        lines.append("• Профиль: " + joined[:300])
     for f in facts[:4]:
         lines.append("• " + str(f))
     if sources:
@@ -212,8 +189,45 @@ def _photo_from_rec(rec: dict) -> Optional[str]:
     if isinstance(img, list):
         return next((u for u in img if isinstance(u, str) and u.strip()), None)
     if isinstance(img, str):
-        return img
-    return None
+        return img.strip() or None
+    basics = rec.get("basics") or {}
+    img2 = basics.get("image_url")
+    return (img2 or None) if isinstance(img2, str) else None
+
+# ------- быстрый поиск по KB (дизамбигуация) -------
+def _score(query: str, candidate: str) -> float:
+    q = (query or "").lower()
+    c = (candidate or "").lower()
+    if not q or not c:
+        return 0.0
+    if q == c:               # идеальное совпадение
+        return 1.0
+    if q in c or c in q:     # подстрока
+        return 0.95
+    return difflib.SequenceMatcher(a=q, b=c).ratio()
+
+def _search_kb_candidates(query: str, k: int = 8) -> List[Tuple[float, dict, str]]:
+    _load_kb_once()
+    scored: List[Tuple[float, dict, str]] = []
+    q = (query or "").strip()
+    if not q:
+        return scored
+
+    for rec in _KB_CACHE:
+        names = _all_names(rec)
+        if not names:
+            continue
+        s = max(_score(q, n) for n in names)
+        if s >= 0.60:
+            # возьмём первый видимый алиас как display
+            display = names[0]
+            scored.append((s, rec, display))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:k]
+
+# кэш кандидатов на пользователя для inline-кнопок
+_USER_CANDIDATES: Dict[int, List[Tuple[float, dict, str]]] = {}
 
 # =========================
 # Вход/выход из AI-режима
@@ -222,9 +236,13 @@ def _photo_from_rec(rec: dict) -> Optional[str]:
 @router.message(F.text == "/ai")
 async def ai_mode_msg(m: Message):
     AI_USERS.add(m.from_user.id)
+    _load_kb_once()  # «ленивый» прогрев
+    kb_size = len(_KB_CACHE)
     await m.answer(
-        "AI-режим включён. Работаем <b>только из оффлайн-базы</b> (ingested_kb.json). "
-        "Чтобы добавить данные — пополни seed_urls.json и запусти GitHub Actions → Ingest.",
+        f"AI-режим включён.\n"
+        f"Источник: <b>только оффлайн-БЗ</b> (ingested_kb.json и пакеты в data/kb/).\n"
+        f"Записей в KB: <b>{kb_size}</b>.\n\n"
+        f"Напиши название бренда/напитка или задавай вопросы по продажам.",
         parse_mode="HTML",
         reply_markup=menu_ai_exit_kb(),
     )
@@ -232,10 +250,11 @@ async def ai_mode_msg(m: Message):
 @router.callback_query(F.data == "ai:enter")
 async def ai_mode_cb(cb: CallbackQuery):
     AI_USERS.add(cb.from_user.id)
+    _load_kb_once()
     with suppress(Exception):
         await cb.answer()
     await cb.message.answer(
-        "AI-режим включён. Работаем <b>только из оффлайн-базы</b> (ingested_kb.json).",
+        "AI-режим включён. Работаем <b>только из оффлайн-БЗ</b>.",
         parse_mode="HTML",
         reply_markup=menu_ai_exit_kb(),
     )
@@ -246,6 +265,7 @@ async def ai_mode_cb(cb: CallbackQuery):
 async def ai_mode_off(ev):
     user_id = ev.from_user.id if hasattr(ev, "from_user") else ev.message.from_user.id
     AI_USERS.discard(user_id)
+    _USER_CANDIDATES.pop(user_id, None)
     if isinstance(ev, CallbackQuery):
         with suppress(Exception):
             await ev.answer()
@@ -253,6 +273,22 @@ async def ai_mode_off(ev):
             await ev.message.answer("AI-режим выключен.")
     else:
         await ev.answer("AI-режим выключен.")
+
+# Доп. команды статуса/перезагрузки KB
+@router.message(F.text == "/ai_status")
+async def ai_status(m: Message):
+    on = m.from_user.id in AI_USERS
+    _load_kb_once()
+    await m.answer(
+        f"AI-режим: {'включён' if on else 'выключен'}\n"
+        f"KB записей: {len(_KB_CACHE)}",
+        reply_markup=menu_ai_exit_kb() if on else None
+    )
+
+@router.message(F.text == "/ai_reload_kb")
+async def ai_reload(m: Message):
+    _load_kb_once(force=True)
+    await m.answer(f"KB перезагружена. Записей: {len(_KB_CACHE)}", reply_markup=menu_ai_exit_kb())
 
 # =========================
 # Главный AI-хендлер (OFFLINE ONLY)
@@ -277,7 +313,7 @@ async def _answer_ai(m: Message, text: str):
         await m.answer("Напишите запрос или название бренда.")
         return
 
-    # ====== РАННИЕ ИНТЕНТЫ (оставляем) ======
+    # ====== РАННИЕ ИНТЕНТЫ (sales) ======
     is_sales, outlet, brand_for_sales = detect_sales_intent(q)
     if is_sales:
         html = ""
@@ -299,135 +335,174 @@ async def _answer_ai(m: Message, text: str):
     any_res = suggest_any_in_category(q)
     if any_res:
         display_cat, names = any_res
-        first = names[0]
-        # даже тут — ищем только в KB
-        rec, disp = _kb_find_local(first)
-        caption = _sanitize_caption(_caption_from_rec(rec, disp)) if rec else f"<b>{first}</b>\n• Нет записи в оффлайн-БЗ."
-        photo = _photo_from_rec(rec) if rec else None
-
-        if photo:
-            await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-        else:
-            await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-
+        # Показываем быстрые кнопки брендов в категории
         try:
             kb = ReplyKeyboardBuilder()
             for n in names[:10]:
                 kb.add(KeyboardButton(text=n))
             kb.add(KeyboardButton(text="Назад"))
             kb.adjust(2)
-            await m.answer(f"Могу предложить бренды в категории «{display_cat}»:",
-                           reply_markup=kb.as_markup(resize_keyboard=True))
+            await m.answer(f"Могу предложить бренды в категории «{display_cat}»:", reply_markup=kb.as_markup(resize_keyboard=True))
         except Exception:
             pass
-        return
-    # ====== КОНЕЦ РАННИХ ИНТЕНТОВ ======
 
-    # индикация "печатает…"
+    # ====== основная логика: поиск карточки в оффлайн-КБ ======
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
     t0 = time.monotonic()
-
     try:
         ai_inc("ai.query", tags={"intent": "brand"})
 
-        # 1) Ищем прямо запись в KB модулем (если есть)
+        # 1) Точный поиск модулем KB, если он присутствует
         rec = None
         disp_name = None
         if kb_find_record:
-            try:
+            with suppress(Exception):
                 tmp = kb_find_record(q)
                 if tmp:
                     rec = tmp
                     disp_name = (tmp.get("name") or tmp.get("brand"))
-            except Exception:
-                rec = None
 
-        # 2) Наш локальный поиск по ingested_kb.json
+        # 2) Быстрый поиск по локальной KB (дизамбигуация)
         if rec is None:
-            rec, disp_name = _kb_find_local(q)
+            candidates = _search_kb_candidates(q, k=8)
+            if not candidates:
+                # нет кандидатов вообще
+                await _reply_kb_miss(m, t0, typing_task, stop_typing)
+                return
 
-        # 3) Если есть — формируем карточку без веба
-        if rec:
-            # сначала красивый caption из KB-модуля, если доступен
-            if build_caption_from_kb != (lambda _: ""):
-                with suppress(Exception):
-                    caption = _sanitize_caption(build_caption_from_kb(rec))
-                if not caption:
-                    caption = _sanitize_caption(_caption_from_rec(rec, disp_name))
-            else:
-                caption = _sanitize_caption(_caption_from_rec(rec, disp_name))
+            # идеальный кандидат (score ~ 1.0) — сразу показываем
+            top_score, top_rec, top_disp = candidates[0]
+            if top_score >= 0.95:
+                await _reply_card(m, top_rec, top_disp, t0, typing_task, stop_typing)
+                return
 
-            photo = _photo_from_rec(rec)
-
-            try:
-                if photo:
-                    await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-                else:
-                    await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-            except TelegramBadRequest:
-                await m.answer(caption, reply_markup=menu_ai_exit_kb())
-
+            # иначе — покажем список на выбор
+            _USER_CANDIDATES[m.from_user.id] = candidates
+            kb = [
+                [InlineKeyboardButton(text=f"{i+1}. {d[:64]}", callback_data=f"ai:pick:{i}")]
+                for i, (_, _, d) in enumerate(candidates)
+            ]
+            await m.answer(
+                "Нашёл несколько вариантов, уточни:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+            )
             stop_typing.set()
             with suppress(Exception):
                 await typing_task
-            dt_ms = (time.monotonic() - t0) * 1000
-            ai_inc("ai.source", tags={"source": "kb_offline"})
-            ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline"})
-            ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline"})
-            log.info("[AI] offline KB card in %.2fs", dt_ms / 1000.0)
             return
 
-        # 4) KB → LLM (если нужно «оживить» формулировку, но только из KB)
-        if kb_retrieve and generate_caption_with_gemini:
-            try:
-                kb = kb_retrieve(q, top_k=8)
-            except TypeError:
-                kb = kb_retrieve(q)
-            if kb and kb.get("results"):
-                try:
-                    caption = await generate_caption_with_gemini(
-                        q, kb,
-                        system_prompt=(
-                            "Ты кратко описываешь напиток строго по данным из локальной БЗ "
-                            "(результаты retrieval). Никаких догадок. Если чего-то нет — пиши 'н/д'. "
-                            "Дай 2–3 лаконичные фразы и 3–6 дегустационных нот списком."
-                        )
-                    )
-                except Exception:
-                    caption = ""
-                caption = _sanitize_caption(caption) or "Нет фактов в оффлайн-БЗ."
-                await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        # 3) Есть запись из kb_find_record — отправляем карточку
+        await _reply_card(m, rec, disp_name, t0, typing_task, stop_typing)
+        return
 
-                stop_typing.set()
-                with suppress(Exception):
-                    await typing_task
-                dt_ms = (time.monotonic() - t0) * 1000
-                ai_inc("ai.source", tags={"source": "kb_offline"})
-                ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline"})
-                ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline"})
-                log.info("[AI] offline KB + Gemini in %.2fs", dt_ms / 1000.0)
-                return
-
-        # 5) Ничего не нашли в оффлайн-БЗ — подсказываем, как «накормить»
-        help_text = (
-            "<b>Не нашёл в оффлайн-базе.</b>\n"
-            "Чтобы добавить бренд без веб-поиска:\n"
-            "1) Открой data/seed_urls.json и добавь точные карточки в \"exact_pages\".\n"
-            "2) Запусти GitHub → Actions → <i>Ingest allowed sites</i> с <b>run_all: true</b>.\n"
-            "3) Проверь, что data/ingested_kb.json обновился — и спроси бренд ещё раз."
-        )
-        await m.answer(help_text, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
-
+    finally:
         stop_typing.set()
         with suppress(Exception):
             await typing_task
-        dt_ms = (time.monotonic() - t0) * 1000
-        ai_inc("ai.source", tags={"source": "kb_offline_miss"})
-        ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline_miss"})
-        ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline_miss"})
-        log.info("[AI] offline KB miss in %.2fs", dt_ms / 1000.0)
 
+async def _reply_card(m: Message, rec: dict, disp_name: Optional[str],
+                      t0: float, typing_task: asyncio.Task, stop_typing: asyncio.Event):
+    # Сначала пробуем красивый caption из KB-модуля (если есть)
+    if build_caption_from_kb != (lambda _: ""):
+        with suppress(Exception):
+            caption = _sanitize_caption(build_caption_from_kb(rec))
+    else:
+        caption = ""
+    if not caption:
+        caption = _sanitize_caption(_caption_from_rec(rec, disp_name))
+
+    photo = _photo_from_rec(rec)
+    try:
+        if photo:
+            await m.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        else:
+            await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+    except TelegramBadRequest:
+        await m.answer(caption, reply_markup=menu_ai_exit_kb())
+
+    stop_typing.set()
+    with suppress(Exception):
+        await typing_task
+    dt_ms = (time.monotonic() - t0) * 1000
+    ai_inc("ai.source", tags={"source": "kb_offline"})
+    ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline"})
+    ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline"})
+    log.info("[AI] offline KB card in %.2fs", dt_ms / 1000.0)
+
+async def _reply_kb_miss(m: Message, t0: float, typing_task: asyncio.Task, stop_typing: asyncio.Event):
+    # Если есть ретривер + Gemini — дадим краткий ответ «только из KB-доков», иначе — инструкция по инжесту
+    if kb_retrieve and generate_caption_with_gemini:
+        try:
+            kb = kb_retrieve(m.text, top_k=8)
+        except TypeError:
+            kb = kb_retrieve(m.text)
+        if kb and kb.get("results"):
+            with suppress(Exception):
+                caption = await generate_caption_with_gemini(
+                    m.text, kb,
+                    system_prompt=(
+                        "Ты кратко описываешь напиток строго по данным из локальной БЗ "
+                        "(результаты retrieval). Никаких догадок. Если чего-то нет — пиши 'н/д'. "
+                        "Дай 2–3 лаконичные фразы и 3–6 дегустационных нот списком."
+                    )
+                )
+            caption = _sanitize_caption(caption) or "Нет фактов в оффлайн-БЗ."
+            await m.answer(caption, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+        else:
+            await _reply_ingest_help(m)
+    else:
+        await _reply_ingest_help(m)
+
+    stop_typing.set()
+    with suppress(Exception):
+        await typing_task
+    dt_ms = (time.monotonic() - t0) * 1000
+    ai_inc("ai.source", tags={"source": "kb_offline_miss"})
+    ai_inc("ai.answer", tags={"intent": "brand", "source": "kb_offline_miss"})
+    ai_observe_ms("ai.latency", dt_ms, tags={"intent": "brand", "source": "kb_offline_miss"})
+    log.info("[AI] offline KB miss in %.2fs", dt_ms / 1000.0)
+
+async def _reply_ingest_help(m: Message):
+    help_text = (
+        "<b>Не нашёл в оффлайн-базе.</b>\n"
+        "Как добавить бренд без веб-поиска:\n"
+        "1) Открой data/seed_urls.json и добавь точные карточки в \"exact_pages\".\n"
+        "2) Запусти GitHub → Actions → <i>Ingest allowed sites</i> c параметром <b>run_all: true</b>.\n"
+        "3) Проверь, что data/ingested_kb.json обновился — и спроси бренд ещё раз."
+    )
+    await m.answer(help_text, parse_mode="HTML", reply_markup=menu_ai_exit_kb())
+
+# =========================
+# Коллбеки: выбор кандидата из списка
+# =========================
+@router.callback_query(F.data.regexp(r"^ai:pick:(\d+)$"))
+async def ai_pick_candidate(cb: CallbackQuery):
+    uid = cb.from_user.id
+    m = cb.message
+    with suppress(Exception):
+        await cb.answer()
+
+    candidates = _USER_CANDIDATES.get(uid) or []
+    try:
+        idx = int(cb.data.split(":")[-1])
+    except Exception:
+        idx = -1
+    if idx < 0 or idx >= len(candidates):
+        with suppress(Exception):
+            await m.answer("Список кандидатов устарел. Напишите запрос ещё раз.")
+        _USER_CANDIDATES.pop(uid, None)
+        return
+
+    _, rec, disp = candidates[idx]
+    _USER_CANDIDATES.pop(uid, None)
+
+    # показываем карточку
+    t0 = time.monotonic()
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_pulse(m, stop_typing))
+    try:
+        await _reply_card(m, rec, disp, t0, typing_task, stop_typing)
     finally:
         stop_typing.set()
         with suppress(Exception):
