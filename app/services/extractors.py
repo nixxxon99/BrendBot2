@@ -1,5 +1,6 @@
 # app/services/extractors.py
 from __future__ import annotations
+import contextlib
 
 from typing import Dict, Any, List, Optional
 import re
