@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       brands:
-        description: 'Список брендов через запятую (пример: Jameson,Grant\'s,Glenfiddich)'
+        description: "Список брендов через запятую (пример: Jameson,Grant's,Glenfiddich)"
         required: false
-        default: ''
-      all:
-        description: 'Прогнать полностью по seed_urls.json? (true/false)'
+        default: ""
+      run_all:
+        description: "Прогнать полностью по seed_urls.json? (true/false)"
         required: false
-        default: 'false'
+        default: "false"
 
 permissions:
   contents: write
@@ -27,13 +27,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # на всякий случай
           pip install beautifulsoup4 requests lxml
 
       - name: Run ingest
@@ -45,7 +44,7 @@ jobs:
           TZ: Asia/Almaty
         run: |
           set -e
-          if [ "${{ github.event.inputs.all }}" = "true" ]; then
+          if [ "${{ github.event.inputs.run_all }}" = "true" ]; then
             python tools/ingest_allowed_sites.py --all
           else
             python tools/ingest_allowed_sites.py --brands "${{ github.event.inputs.brands }}"
