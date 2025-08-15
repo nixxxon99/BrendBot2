@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       brands:
-        description: "Список брендов через запятую (пример: Jameson,Grant's,Glenfiddich)"
+        description: "Список брендов через запятую (пример: Jameson,Grant's,Glenfiddich). Оставь пустым, чтобы пройти весь seed_urls.json"
         required: false
         default: ""
-      run_all:
-        description: "Прогнать полностью по seed_urls.json? (true/false)"
-        required: false
-        default: "false"
 
 permissions:
   contents: write
@@ -44,10 +40,12 @@ jobs:
           TZ: Asia/Almaty
         run: |
           set -e
-          if [ "${{ github.event.inputs.run_all }}" = "true" ]; then
-            python tools/ingest_allowed_sites.py --all
-          else
+          if [ -n "${{ github.event.inputs.brands }}" ]; then
+            echo "Running ingest for brands: ${{ github.event.inputs.brands }}"
             python tools/ingest_allowed_sites.py --brands "${{ github.event.inputs.brands }}"
+          else
+            echo "Running full ingest from data/seed_urls.json"
+            python tools/ingest_allowed_sites.py
           fi
           echo "Ingest finished."
 
