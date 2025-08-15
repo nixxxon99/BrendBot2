@@ -1,0 +1,67 @@
+name: Ingest allowed sites
+
+on:
+  workflow_dispatch:
+    inputs:
+      brands:
+        description: 'Список брендов через запятую (пример: Jameson,Grant\'s,Glenfiddich)'
+        required: false
+        default: ''
+      all:
+        description: 'Прогнать полностью по seed_urls.json? (true/false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # на всякий случай
+          pip install beautifulsoup4 requests lxml
+
+      - name: Run ingest
+        env:
+          GOOGLE_CSE_KEY: ${{ secrets.GOOGLE_CSE_KEY }}
+          GOOGLE_CSE_CX: ${{ secrets.GOOGLE_CSE_CX }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SEARCH_ALLOWED_DOMAINS: ${{ secrets.SEARCH_ALLOWED_DOMAINS }}
+          TZ: Asia/Almaty
+        run: |
+          set -e
+          if [ "${{ github.event.inputs.all }}" = "true" ]; then
+            python tools/ingest_allowed_sites.py --all
+          else
+            python tools/ingest_allowed_sites.py --brands "${{ github.event.inputs.brands }}"
+          fi
+          echo "Ingest finished."
+
+      - name: Commit changes if any
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain data/ingested_kb.json)" ]; then
+            git add data/ingested_kb.json
+            git commit -m "chore(ingest): update ingested_kb.json [CI]"
+            git push
+            echo "Changes committed."
+          else
+            echo "No changes to commit."
+          fi
